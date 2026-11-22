@@ -616,11 +616,11 @@ const LISTING_WAIT: f64 = 0.5;
 
 /// The link in `input` when it is a single http(s) link to a media site's video, whose qualities
 /// the card lists (see [`quality_picker`]); not a playlist's or a channel's, whose videos are not
-/// each asked about.
+/// each asked about, unless it is music (an album, a playlist, an artist), which the card tells of.
 fn media_link(input: &str) -> Option<Url> {
     let input = input.trim();
     let url = Url::parse(input).ok().filter(|u| matches!(u.scheme(), "http" | "https") && !input.contains(char::is_whitespace))?;
-    let list = media::lists(&url) && !media::video_in_playlist(&url);
+    let list = media::lists(&url) && !media::video_in_playlist(&url) && hyperfetch_core::music::kind(&url).is_none();
     (media::is_supported_media_site(&url) && !list).then_some(url)
 }
 
@@ -661,16 +661,47 @@ fn quality_picker(app: &mut App, ui: &mut Ui) -> bool {
         ui.add_space(4.0);
         return false;
     }
-    let Some(q) = card.qualities().cloned() else { return false };
-    let (taken, note) = q.take(&app.settings.media_pick(&url));
-    let made = card.pick.is_some();
-    let chosen = card.pick.clone().unwrap_or(taken);
-    let language = chosen.language.as_deref();
-    let mut clicked = None;
     let row = |ui: &mut Ui, name: &str| {
         ui.add_sized([62.0, 22.0], egui::Label::new(bold(name).color(p.text)));
     };
-    for height in &q.heights {
+    // A music link is audio alone, saved in the music library: what it is, and how its audio is kept.
+    let music = card.music().map(str::to_string);
+    if let Some(said) = &music {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(icon::MUSIC_NOTES).color(p.accent));
+            ui.label(RichText::new(said).color(p.text));
+        });
+    }
+    let Some(q) = card.qualities().cloned() else {
+        // A music list: its songs are each read as they download, so no sizes.
+        if music.is_none() {
+            return false;
+        }
+        let chosen = card.pick.clone().unwrap_or_else(|| app.settings.media_pick(&url));
+        let mut clicked = None;
+        ui.horizontal_wrapped(|ui| {
+            row(ui, "Audio");
+            for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3)] {
+                if ui.selectable_label(chosen.audio.unwrap_or(AudioForm::Original) == form, name).clicked() {
+                    clicked = Some(MediaPick { audio: Some(form), language: chosen.language.clone(), ..Default::default() });
+                }
+            }
+        });
+        ui.add_space(4.0);
+        if let (Some(pick), Some(card)) = (clicked, app.media_card.as_mut()) {
+            card.pick = Some(pick);
+        }
+        return true;
+    };
+    let (taken, note) = q.take(&app.settings.media_pick(&url));
+    let made = card.pick.is_some();
+    let mut chosen = card.pick.clone().unwrap_or(taken);
+    if music.is_some() && chosen.audio.is_none() {
+        chosen = q.take(&MediaPick { audio: Some(AudioForm::Original), language: chosen.language.clone(), ..Default::default() }).0;
+    }
+    let language = chosen.language.as_deref();
+    let mut clicked = None;
+    for height in q.heights.iter().filter(|_| music.is_none()) {
         ui.horizontal_wrapped(|ui| {
             row(ui, &format!("{}p", height.p));
             for option in &height.options {
@@ -1148,6 +1179,50 @@ mod tests {
         h.app.url_input = list.to_string();
         h.frames(90);
         assert!(asked(list) == 0 && shown(&h, MEDIA_PRESETS[1]) && h.find("Reading its qualities…").is_none(), "{:?}", h.texts());
+    }
+
+    /// A music link's card says what it is and offers its audio alone: a song's as the site has
+    /// it, as M4A or as MP3, an album's or playlist's too, whose songs are read as they download.
+    #[test]
+    fn a_music_links_card_says_what_it_is_and_offers_audio_alone() {
+        use hyperfetch_core::media::MediaQualityPreset::Pick;
+        use hyperfetch_core::quality::{AudioForm, MediaPick};
+        let mut h = Harness::new();
+        h.app.settings.auto_run_queue = false;
+        let show = |h: &mut Harness, link: &str| {
+            h.app.url_input = link.to_string();
+            // Read once the link has stood still for half a second of frames.
+            let listing = |app: &App| app.media_card.as_ref().is_some_and(|card| card.link == link);
+            for _ in 0..90 {
+                if listing(&h.app) {
+                    break;
+                }
+                h.frames(1);
+            }
+            h.wait_for(|app| listing(app) && app.media_card.as_ref().is_some_and(|card| card.listed.is_some()));
+            assert!(h.settle());
+        };
+        let shown = |h: &Harness, text: &str| h.find(text).is_some();
+        let song = "https://music.youtube.com/watch?v=sample4k60";
+        show(&mut h, song);
+        assert!(shown(&h, "A song by Sample Artist") && shown(&h, "Original · Opus 129 kbps · 9.7 MiB"), "{:?}", h.texts());
+        assert!(!shown(&h, "2160p") && !shown(&h, "1080p") && !shown(&h, MEDIA_PRESETS[1]), "no video rows: {:?}", h.texts());
+        // Picked, a song is downloaded as picked; the core keeps any other quality to its audio.
+        h.click("MP3 · converted from Opus");
+        let mut options = hyperfetch_core::engine::DownloadOptions::default();
+        h.app.card_pick(&[Url::parse(song).unwrap()], &mut options);
+        assert!(matches!(options.media_preset, Some(Pick(MediaPick { audio: Some(AudioForm::Mp3), .. }))), "{:?}", options.media_preset);
+        // An album: what it is, and its audio as a choice without sizes.
+        let album = "https://music.youtube.com/playlist?list=OLAK5uy_sample";
+        show(&mut h, album);
+        for text in ["An album of 3 songs by Sample Artist", "Original", "M4A", "MP3"] {
+            assert!(shown(&h, text), "{text} in {:?}", h.texts());
+        }
+        h.click("M4A");
+        let mut options = hyperfetch_core::engine::DownloadOptions::default();
+        h.app.card_pick(&[Url::parse(album).unwrap()], &mut options);
+        assert_eq!(options.media_preset, Some(Pick(MediaPick { audio: Some(AudioForm::M4a), ..Default::default() })));
+        assert_eq!(h.app.settings.media_picks.get("music.youtube.com").and_then(|pick| pick.audio), Some(AudioForm::M4a));
     }
 
     /// A video page's link ends in "watch", a playlist's in "videos": the card names neither,

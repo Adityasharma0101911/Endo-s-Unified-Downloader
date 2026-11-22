@@ -302,6 +302,11 @@ pub struct DownloadOptions {
     pub media_name: Option<String>,
     /// Lines the download archive gets once the download finishes (see `ingest::Task::archive`).
     pub archive_lines: Vec<String>,
+    /// A song of a music list, with what the list knows of it (see `ingest::Task::music`); a
+    /// music link alone is one without it (see `media_options_for`).
+    pub music: Option<crate::music::Music>,
+    /// A song's synced lyrics are asked of LRCLIB and saved next to it (see `music::lyrics`).
+    pub lyrics: bool,
     /// Proxy pool for multi-egress rotation across workers.
     pub proxy_pool: Vec<String>,
     /// Debrid API key. Never saved with the options: a front end fills it in from its settings
@@ -503,6 +508,8 @@ impl Default for DownloadOptions {
             merge_format: None,
             media_name: None,
             archive_lines: Vec::new(),
+            music: None,
+            lyrics: false,
             proxy_pool: Vec::new(),
             debrid_api_key: None,
             debrid_provider: None,
@@ -2336,6 +2343,8 @@ impl DownloadEngine {
             video_password: None,
             login: None,
             record_seconds: self.options.record_seconds,
+            music: self.options.music.clone(),
+            lyrics: self.options.lyrics,
         }
     }
 
@@ -2344,6 +2353,10 @@ impl DownloadEngine {
     /// signs in to the user name and password of a Basic sign-in, under that site's name.
     fn media_options_for(&self, url: &Url) -> crate::media::MediaDownloadOptions {
         let mut options = self.media_options();
+        // A music link is a song wherever it came from.
+        if crate::music::kind(url).is_some() {
+            options.music.get_or_insert_with(Default::default);
+        }
         if self.auth.as_ref().is_some_and(|auth| auth.allows(url)) {
             options.video_password = self.options.password.clone();
             let login = self.options.auth_header.as_deref().and_then(basic_login);

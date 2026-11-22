@@ -501,7 +501,8 @@ function renderMediaCard(info) {
   if (chip) Object.assign($("mc-live"), { textContent: chip[0], className: `chip tone-${chip[1]}` });
   $("mc-title").textContent = info.title || tab.title || "";
   $("mc-title").title = info.title || "";
-  $("mc-channel").textContent = info.uploader || hostOf(tab.url);
+  // A music link says what it is ("An album of 14 songs by ..."): the app saves it as audio.
+  $("mc-channel").textContent = info.music || info.uploader || hostOf(tab.url);
   // A thumbnail that fails to load leaves the card's gradient, not a broken-image box.
   if (/^https?:\/\//i.test(info.thumbnail || "")) {
     Object.assign($("mc-thumb"), { src: info.thumbnail, hidden: false, onerror: () => ($("mc-thumb").hidden = true) });

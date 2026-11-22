@@ -59,6 +59,8 @@ pub struct Task {
     /// The channel of a channel list it records (see [`Channel`]): its name, for
     /// `engine::DownloadOptions::channel`.
     pub channel: Option<String>,
+    /// A song of a music list, with what the list knows of it (see `crate::music`).
+    pub music: Option<crate::music::Music>,
 }
 
 impl Task {
@@ -143,6 +145,9 @@ pub struct ListOptions {
     pub max_items: Option<usize>,
     /// The user's keys for services that need one (see [`Keys`]).
     pub keys: Keys,
+    /// The save folder, where a music playlist's `.m3u8` file is written (see `crate::music`);
+    /// None writes none.
+    pub save_dir: Option<PathBuf>,
 }
 
 /// The user's own keys for the services that ask for one, from Settings or the command line: each
@@ -224,6 +229,7 @@ impl Default for ListOptions {
             formats: Vec::new(),
             max_items: None,
             keys: Keys::default(),
+            save_dir: None,
         }
     }
 }

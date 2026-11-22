@@ -12,6 +12,7 @@ pub mod torrent;
 pub mod queue;
 pub mod relink;
 pub mod media;
+pub mod music;
 pub mod quality;
 pub mod history;
 pub mod verify;

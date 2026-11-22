@@ -113,6 +113,8 @@ pub struct Settings {
     pub subtitles: String,
     /// Title, artist, date and URL tags, chapters and cover art inside media files.
     pub embed_metadata: bool,
+    /// A song's synced lyrics are asked of lrclib.net and saved next to it (see `music::lyrics`).
+    pub lyrics: bool,
     /// Record live streams from their start.
     pub live_from_start: bool,
     /// Wait for a scheduled stream or premiere to begin instead of failing.
@@ -377,6 +379,7 @@ impl Default for Settings {
             install_ffmpeg: None,
             subtitles: String::new(),
             embed_metadata: engine.embed_metadata,
+            lyrics: false,
             live_from_start: engine.live_from_start,
             wait_for_video: engine.wait_for_video,
             sponsorblock: 0,
@@ -576,6 +579,7 @@ impl Settings {
             install_ffmpeg: self.install_ffmpeg == Some(true),
             subtitles: non_empty(&self.subtitles),
             embed_metadata: self.embed_metadata,
+            lyrics: self.lyrics,
             live_from_start: self.live_from_start,
             wait_for_video: self.wait_for_video,
             sponsorblock: match self.sponsorblock {
@@ -716,10 +720,12 @@ impl Settings {
             formats: self.archive_formats.split(',').map(str::trim).filter(|f| !f.is_empty()).map(str::to_string).collect(),
             max_items: None,
             keys: hyperfetch_core::ingest::Keys { curseforge: non_empty(&self.curseforge_key), unpaywall_email: non_empty(&self.unpaywall_email), itch: non_empty(&self.itch_key), kaggle: non_empty(&self.kaggle_json) },
+            save_dir: non_empty(&self.save_dir).map(PathBuf::from),
         }
     }
 
-    fn browser_cookies(&self) -> Option<BrowserCookieSource> {
+    /// The browser whose cookies media downloads go with, when one is chosen.
+    pub fn browser_cookies(&self) -> Option<BrowserCookieSource> {
         match self.browser_cookies {
             1 => Some(BrowserCookieSource::Chrome),
             2 => Some(BrowserCookieSource::Edge),

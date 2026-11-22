@@ -864,6 +864,9 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
     text_setting(ui, "Subtitles", about, &mut s.subtitles, "en,es or all", false);
     let about = "Title, artist, date, description, link and chapters inside the file (needs ffmpeg).";
     switch(ui, "Embed tags and chapters", about, &mut s.embed_metadata);
+    let about = "A YouTube Music or SoundCloud song gets a .lrc file of timed lyrics next to it, from lrclib.net, when its title, \
+                 artist and length match. Its title, artist, album and length are sent to lrclib.net.";
+    switch(ui, "Synced lyrics for music", about, &mut s.lyrics);
     let about = "Where the site keeps it, from its start instead of from now. Stop finishes the recording and keeps it.";
     switch(ui, "Record live streams from the start", about, &mut s.live_from_start);
     let about = "A stream or premiere that has not begun is waited for, checking every 1 to 10 minutes. Stop ends the wait.";

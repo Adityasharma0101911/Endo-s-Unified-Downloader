@@ -225,6 +225,11 @@ impl MediaCard {
     fn qualities(&self) -> Option<&Qualities> {
         self.listed.as_ref()?.as_ref().ok()?.qualities.as_ref()
     }
+
+    /// Of a music link, what it is (see `MediaInfo::music`).
+    fn music(&self) -> Option<&str> {
+        self.listed.as_ref()?.as_ref().ok()?.music.as_deref()
+    }
 }
 
 /// The New link box of a stopped download (see `ui::queue`): what is typed in it, whether that is
@@ -727,7 +732,13 @@ impl App {
         let link = url.to_string();
         self.media_card = Some(MediaCard { link: link.clone(), listed: None, pick: None });
         let given = |text: &str| Some(text.trim().to_string()).filter(|text| !text.is_empty());
-        let (cookies, proxy) = (given(&self.settings.cookies_path).map(PathBuf::from), given(&self.settings.proxy));
+        let (file, proxy) = (given(&self.settings.cookies_path).map(PathBuf::from), given(&self.settings.proxy));
+        // A music link is read as it is downloaded, with the browser's sign-in: it tells a
+        // SoundCloud artist's original file.
+        let cookies = match self.settings.browser_cookies().filter(|_| hyperfetch_core::music::kind(&url).is_some()) {
+            Some(browser) => browser,
+            None => file.map_or(media::BrowserCookieSource::None, media::BrowserCookieSource::File),
+        };
         // A video in a playlist is asked about alone: the list is read when it is downloaded.
         let mut asked = url;
         if media::video_in_playlist(&asked) {
@@ -746,10 +757,12 @@ impl App {
     fn card_pick(&mut self, urls: &[Url], options: &mut DownloadOptions) {
         let Some(url) = urls.first() else { return };
         let Some(card) = self.media_card.as_ref().filter(|card| card.link == url.as_str()) else { return };
-        let Some(qualities) = card.qualities() else { return };
-        let pick = match &card.pick {
-            Some(pick) => pick.clone(),
-            None => qualities.take(&self.settings.media_pick(url)).0,
+        let pick = match (&card.pick, card.qualities()) {
+            (Some(pick), _) => pick.clone(),
+            (None, Some(qualities)) => qualities.take(&self.settings.media_pick(url)).0,
+            // A music list's songs are read as they download: the site's rule as it is.
+            (None, None) if card.music().is_some() => self.settings.media_pick(url),
+            (None, None) => return,
         };
         if card.pick.is_some() {
             self.settings.remember_pick(url, &pick);
@@ -1340,6 +1353,10 @@ impl App {
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str, ranges: bool) {
         self.tab = Tab::Downloads;
         let update = self.update_on_disk.take();
+        // A music list's songs, listed later, take the audio chosen on its card: kept for the site.
+        if let Some(url) = ingest::http_url(text.trim()).filter(|url| hyperfetch_core::music::kind(url).is_some()) {
+            self.card_pick(std::slice::from_ref(&url), &mut DownloadOptions::default());
+        }
         // The first link of a paste with secrets starts, the others wait; the form clears as
         // it starts (it held the secrets).
         match self.add_pasted(text, checksum, auth, Origin::Form) {
@@ -2935,6 +2952,7 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
         options.output_path = options.output_path.map(|path| path.join(""));
     }
     options.media_name = task.media_name.clone();
+    options.music = task.music.clone();
     options.channel = task.channel.clone();
     options.metalink_pieces = task.pieces.clone();
     options.archive_lines = task.archive.clone();
@@ -3023,24 +3041,32 @@ fn choose_media(options: &mut DownloadOptions, choice: &ipc::MediaChoice) {
 
 /// What `media::info` tells of the media link `url`, asked through `proxy` with `cookies`.
 #[cfg(not(test))]
-async fn media_listing(url: &Url, cookies: Option<PathBuf>, proxy: Option<String>) -> Result<media::MediaInfo, String> {
-    media::info(url, cookies.as_deref(), proxy.as_deref()).await
+async fn media_listing(url: &Url, cookies: media::BrowserCookieSource, proxy: Option<String>) -> Result<media::MediaInfo, String> {
+    media::info_as(url, &cookies, proxy.as_deref()).await
 }
 
 /// A stand-in for `media::info` that runs no yt-dlp: the 4K sample's listing for a link that
 /// names it, an answer without formats for another, a failure for one that says "fail"; each
 /// link asked kept in [`tests::MEDIA_ASKED`].
 #[cfg(test)]
-async fn media_listing(url: &Url, _cookies: Option<PathBuf>, _proxy: Option<String>) -> Result<media::MediaInfo, String> {
+async fn media_listing(url: &Url, _cookies: media::BrowserCookieSource, _proxy: Option<String>) -> Result<media::MediaInfo, String> {
     lock(&tests::MEDIA_ASKED).push(url.to_string());
     if url.as_str().contains("fail") {
         return Err("Sign in to confirm your age.".to_string());
+    }
+    // A music album, as a listing tells it.
+    if url.as_str().contains("OLAK5uy_") {
+        let playlist = media::MediaPlaylist { title: "Album - Sample Album".to_string(), count: 3 };
+        let music = Some("An album of 3 songs by Sample Artist".to_string());
+        return Ok(media::MediaInfo { title: playlist.title.clone(), playlist: Some(playlist), music, ..Default::default() });
     }
     let found = match url.as_str().contains("sample4k60") {
         true => include_str!("../../hyperfetch-core/tests/data/media-4k60.json"),
         false => r#"{"title": "A list"}"#,
     };
-    Ok(media::media_info(&serde_json::from_str(found).map_err(|e| e.to_string())?))
+    let info = media::media_info(&serde_json::from_str(found).map_err(|e| e.to_string())?);
+    let music = hyperfetch_core::music::kind(url).map(|_| "A song by Sample Artist".to_string());
+    Ok(media::MediaInfo { music, ..info })
 }
 
 /// Queues one download; one its input named is shown under that name at once. Its target is

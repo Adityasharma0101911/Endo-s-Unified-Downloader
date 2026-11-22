@@ -621,6 +621,8 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         name_pattern: args.name_pattern.clone(),
         channel: task.channel,
         media_name: task.media_name,
+        music: task.music,
+        lyrics: args.lyrics,
         archive_lines: task.archive,
         bittorrent: task.p2p,
         torrent_files: task.torrent_files,
@@ -679,6 +681,8 @@ fn list_options(args: &Args) -> ListOptions {
         formats: args.formats.iter().map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect(),
         max_items: args.max_items,
         keys: hyperfetch_core::ingest::Keys { curseforge: args.curseforge_key.clone(), unpaywall_email: args.unpaywall_email.clone(), itch: args.itch_key.clone(), kaggle: args.kaggle_json.clone() },
+        // A music playlist's .m3u8 goes where its songs' library is.
+        save_dir: Some(args.dir.clone().unwrap_or_else(|| PathBuf::from("."))),
     }
 }
 
@@ -1740,6 +1744,12 @@ mod tests {
         assert_eq!(output, Path::new("d").join("Show").join(""));
         assert!(std::path::is_separator(*output.as_os_str().as_encoded_bytes().last().unwrap() as char));
         assert_eq!(options.media_name, Some(template));
+        // A song of an album: the library places it, from what its listing knew.
+        let music = hyperfetch_core::music::Music { track: Some(2), album: Some("Sample Album".into()), ..Default::default() };
+        let song = Task { urls: vec![Url::parse("https://music.youtube.com/watch?v=aaaaaaaaaa2").unwrap()], music: Some(music.clone()), ..Default::default() };
+        let options = job(&parse(&["--lyrics", "u"]), 4, Path::new("d"), song).options;
+        assert_eq!((options.music, options.lyrics), (Some(music), true));
+        assert_eq!(list_options(&parse(&["-d", "lib", "u"])).save_dir, Some(PathBuf::from("lib")));
     }
 
     #[test]

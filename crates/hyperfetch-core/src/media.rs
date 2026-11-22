@@ -187,6 +187,11 @@ pub struct MediaDownloadOptions {
     pub login: Option<(&'static str, String, String)>,
     /// A live recording ends after this many seconds of it, as a stop ends it (see [`run_ytdlp`]).
     pub record_seconds: Option<u64>,
+    /// A song, saved as audio in the music library under the save folder, as what its listing
+    /// knew and what yt-dlp finds place it (see `music`).
+    pub music: Option<crate::music::Music>,
+    /// A song's synced lyrics are asked of LRCLIB (see `music::lyrics`).
+    pub lyrics: bool,
 }
 
 impl MediaDownloadOptions {
@@ -221,6 +226,8 @@ impl Default for MediaDownloadOptions {
             video_password: None,
             login: None,
             record_seconds: None,
+            music: None,
+            lyrics: false,
         }
     }
 }
@@ -411,24 +418,24 @@ impl ListKind {
 }
 
 /// The host of `url` without `www.` or `m.`, and its path's segments.
-fn url_shape(url: &Url) -> (String, Vec<&str>) {
+pub(crate) fn url_shape(url: &Url) -> (String, Vec<&str>) {
     let host = url.host_str().unwrap_or_default().trim_end_matches('.').to_ascii_lowercase();
     let host = host.strip_prefix("www.").or_else(|| host.strip_prefix("m.")).map_or_else(|| host.clone(), str::to_string);
     (host, url.path_segments().map_or_else(Vec::new, |s| s.filter(|s| !s.is_empty()).collect()))
 }
 
 /// Whether `url` has the query parameter `name`, not empty.
-fn has_param(url: &Url, name: &str) -> bool {
+pub(crate) fn has_param(url: &Url, name: &str) -> bool {
     url.query_pairs().any(|(key, value)| key == name && !value.is_empty())
 }
 
 /// The value of the query parameter `name` of `url`, if any.
-fn param(url: &Url, name: &str) -> Option<String> {
+pub(crate) fn param(url: &Url, name: &str) -> Option<String> {
     url.query_pairs().find(|(key, _)| key == name).map(|(_, value)| value.into_owned())
 }
 
 /// First path segments of soundcloud.com that are its own pages, not users.
-const SOUNDCLOUD_PAGES: &[&str] = &[
+pub(crate) const SOUNDCLOUD_PAGES: &[&str] = &[
     "discover", "stream", "feed", "charts", "search", "upload", "you", "settings", "messages", "notifications", "people",
     "pages", "pro", "jobs", "imprint", "terms-of-use", "community-guidelines", "stories", "topic", "download", "go",
     "getstarted", "company", "mobile", "signin", "logout", "popular", "tags", "stations", "playlists",
@@ -453,6 +460,9 @@ fn list_kind(url: &Url) -> Option<ListKind> {
                 _ => Playlist,
             })
         }
+        // A YouTube Music album's page (yt-dlp reads its playlist), and an artist's.
+        ("music.youtube.com", ["browse", id]) if id.starts_with("MPREb") => Some(Playlist),
+        ("music.youtube.com", ["channel", _]) => Some(Uploads),
         ("youtube.com", [handle, rest @ ..]) if handle.starts_with('@') && tab(rest) => Some(Uploads),
         ("youtube.com", ["channel" | "c" | "user", _, rest @ ..]) if tab(rest) => Some(Uploads),
         // A set's link may end in its secret token.
@@ -614,6 +624,9 @@ async fn list_prepared<'a>(
         Ok(listed) => listed,
         Err(e) => return Some(Err(e)),
     };
+    if let Some(kind) = crate::music::kind(url) {
+        return Some(music_listed(kind, listed, options, tools.library.clone()).await);
+    }
     let Some(file) = tools.archive.clone().filter(|_| options.only_new) else {
         return Some(Ok(list_tasks(listed, None)));
     };
@@ -653,6 +666,8 @@ struct ListEntry {
     url: Url,
     /// Its line in the download archive (see [`archive_id`]), when yt-dlp names its site and id.
     archive_id: Option<String>,
+    /// A song of a music list: its album and place on it when the list is an album.
+    music: Option<crate::music::Music>,
 }
 
 impl ListEntry {
@@ -664,12 +679,14 @@ impl ListEntry {
 
 /// The entries of the list yt-dlp printed (`-J --flat-playlist`), in order: those of the lists in
 /// it (a channel's tabs) in their place; without streams that are live or still to come, which
-/// a later listing finds once they are videos, and without entries it gives no link for.
-fn list_entries(info: &Value) -> Vec<Listed> {
+/// a later listing finds once they are videos, and without entries it gives no link for. Of a
+/// `music` list, songs, numbered in their order when the list is an album (see `music::album_of`).
+fn list_entries(info: &Value, music: bool) -> Vec<Listed> {
+    let album = if music { crate::music::album_of(info) } else { None };
     let mut listed = Vec::new();
-    for entry in info["entries"].as_array().into_iter().flatten() {
+    for (place, entry) in info["entries"].as_array().into_iter().flatten().enumerate() {
         if entry["_type"] == "playlist" {
-            listed.extend(list_entries(entry));
+            listed.extend(list_entries(entry, music));
             continue;
         }
         if matches!(entry["live_status"].as_str(), Some("is_live" | "is_upcoming" | "post_live")) {
@@ -682,7 +699,9 @@ fn list_entries(info: &Value) -> Vec<Listed> {
         listed.push(if lists(&url) && !video_in_playlist(&url) {
             Listed::Nested(url)
         } else {
-            Listed::Entry(ListEntry { archive_id: archive_id(entry), url })
+            let track = album.as_ref().map(|_| place as u32 + 1);
+            let music = music.then(|| crate::music::Music { track, ..album.clone().unwrap_or_default() });
+            Listed::Entry(ListEntry { archive_id: archive_id(entry), url, music })
         });
     }
     listed
@@ -711,7 +730,8 @@ async fn list_entries_of<F: std::future::Future<Output = ListRun>>(
         return None;
     }
     let title = ["title", "id"].iter().find_map(|key| info[*key].as_str()).unwrap_or(url.as_str()).to_string();
-    let listed = list_entries(&info);
+    let music = crate::music::kind(url).is_some();
+    let listed = list_entries(&info, music);
     // The lists among the entries, each once, in the order they are read.
     let mut nested: Vec<Url> = Vec::new();
     for listed in &listed {
@@ -762,20 +782,20 @@ async fn list_entries_of<F: std::future::Future<Output = ListRun>>(
         let Some(inner) = found.remove(&nested_url) else { continue };
         match inner {
             Ok(inner) if inner["_type"] == "playlist" => {
-                for listed in list_entries(&inner) {
+                for listed in list_entries(&inner, music) {
                     add(
                         match listed {
                             Listed::Entry(entry) => entry,
-                            Listed::Nested(url) => ListEntry { url, archive_id: None },
+                            Listed::Nested(url) => ListEntry { url, archive_id: None, music: music.then(Default::default) },
                         },
                         &mut entries,
                     );
                 }
             }
-            Ok(one) => add(ListEntry { archive_id: archive_id(&one), url: nested_url }, &mut entries),
+            Ok(one) => add(ListEntry { archive_id: archive_id(&one), url: nested_url, music: music.then(Default::default) }, &mut entries),
             Err(e) => {
                 tracing::warn!("Could not list {nested_url}, which is downloaded as it is: {e}");
-                add(ListEntry { url: nested_url, archive_id: None }, &mut entries);
+                add(ListEntry { url: nested_url, archive_id: None, music: music.then(Default::default) }, &mut entries);
             }
         }
     }
@@ -813,6 +833,54 @@ fn list_tasks((title, entries): (String, Vec<ListEntry>), archive: Option<&HashS
         tracing::info!("Nothing new in {title}: its {listed} item(s) were downloaded before");
     }
     tasks
+}
+
+/// The songs of the music list `title` (see [`music_tasks`]), of `kind`, with the songs in the
+/// library index `library`; a playlist (a list whose songs no album numbers, not an artist's
+/// page) also writes its `.m3u8` file in the save folder, in its order, naming the songs the
+/// library holds already, the others as they arrive. Its songs in the library are never
+/// downloaded again, whatever `only_new` says.
+async fn music_listed(
+    kind: crate::music::Kind,
+    (title, entries): (String, Vec<ListEntry>),
+    options: &crate::ingest::ListOptions,
+    library: Option<PathBuf>,
+) -> Result<Vec<crate::ingest::Task>, String> {
+    let playlist = kind != crate::music::Kind::Artist && entries.iter().all(|e| e.music.as_ref().is_none_or(|m| m.album.is_none()));
+    let name = crate::ingest::clean_path([title.as_str()]).ok().filter(|_| playlist);
+    let file = options.save_dir.as_ref().zip(name).map(|(dir, name)| dir.join(format!("{}.m3u8", name.display())));
+    let ids: Vec<String> = entries.iter().map(ListEntry::key).collect();
+    let made = tokio::task::spawn_blocking(move || {
+        // Its songs of an earlier listing may be finishing (see `song_downloaded`).
+        let _lock = library.as_deref().map(crate::history::lock_file).transpose().map_err(|e| format!("Cannot open the music library: {e}"))?;
+        let library = library.map(|file| crate::music::read_library(&file)).unwrap_or_default();
+        if let Some(file) = &file {
+            crate::music::write_playlist(file, &title, &ids, &library).map_err(|e| format!("Cannot write the playlist {}: {e}", file.display()))?;
+        }
+        let listed = entries.len();
+        let tasks = music_tasks(entries, &library, file);
+        if tasks.is_empty() {
+            tracing::info!("Nothing new in {title}: its {listed} song(s) are in the library");
+        }
+        Ok(tasks)
+    });
+    made.await.map_err(|e| format!("Background task failed: {e}"))?
+}
+
+/// One task per song of a music list that the library index (`library`) lacks, or whose file is
+/// gone: saved under the save folder where what yt-dlp finds at it places it (see
+/// `music::file_template`), listed in `playlist` when given.
+fn music_tasks(entries: Vec<ListEntry>, library: &HashMap<String, PathBuf>, playlist: Option<PathBuf>) -> Vec<crate::ingest::Task> {
+    entries
+        .into_iter()
+        .filter(|entry| !entry.archive_id.as_ref().and_then(|id| library.get(id)).is_some_and(|file| file.is_file()))
+        .map(|entry| crate::ingest::Task {
+            urls: vec![entry.url],
+            from_document: true,
+            music: Some(crate::music::Music { playlist: playlist.clone(), ..entry.music.unwrap_or_default() }),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// The line of the download archive for what yt-dlp found (`extractor_key`) or lists (`ie_key`)
@@ -2517,6 +2585,9 @@ fn build_ytdlp_args(
     if kind == RunKind::Download {
         args.extend(embed_args(options, ffmpeg_dir.is_some()));
         args.extend(edit_args(options));
+        if let Some(music) = &options.music {
+            args.extend(crate::music::ytdlp_args(music, options.preset.extracts_audio()));
+        }
     }
 
     if supports(NO_PLUGIN_DIRS_MIN_VERSION) {
@@ -2549,7 +2620,11 @@ fn build_ytdlp_args(
         args.extend(["--concurrent-fragments".to_string(), options.concurrent_fragments.min(32).to_string()]);
     }
 
-    let mut file_template = options.output_filename.clone().unwrap_or_else(|| "%(title)s.%(ext)s".to_string());
+    // A song goes where the music library has it, whatever name it was given.
+    let mut file_template = match &options.music {
+        Some(music) => crate::music::file_template(music),
+        None => options.output_filename.clone().unwrap_or_else(|| "%(title)s.%(ext)s".to_string()),
+    };
     // A clip is named by its span before the extension: yt-dlp would take one clip's file for
     // another's, or for the whole video's, as already downloaded.
     if !options.sections.is_empty() {
@@ -2694,11 +2769,12 @@ async fn report_subtitles(video: &Path, options: &MediaDownloadOptions) {
 /// into the file, and cover art into an audio file, as `options` ask. ffmpeg writes them: none
 /// without it.
 fn embed_args(options: &MediaDownloadOptions, have_ffmpeg: bool) -> Vec<String> {
-    if !options.embed_metadata || !have_ffmpeg {
+    // A song's tags and cover are what a music library goes by, whatever the setting says.
+    if !(options.embed_metadata || options.music.is_some()) || !have_ffmpeg {
         return Vec::new();
     }
     let mut args = vec!["--embed-metadata", "--embed-chapters"];
-    if options.preset.extracts_audio() {
+    if options.preset.extracts_audio() || options.music.is_some() {
         args.push("--embed-thumbnail");
     } else {
         args.extend(NO_FASTSTART_METADATA);
@@ -4552,7 +4628,10 @@ pub(crate) async fn download_media_with(
     fetch: Option<&StreamFetcher<'_>>,
     extracted: Option<Extracted>,
 ) -> Result<PathBuf, String> {
-    let (options, mut tools) = prepare(options, &cancel_flag, true).await?;
+    let (mut options, mut tools) = prepare(options, &cancel_flag, true).await?;
+    if options.music.is_some() {
+        options.preset = crate::music::audio_preset(&options.preset);
+    }
     let proxy = options.proxy.clone();
     let install = async move { install_managed_ffmpeg(proxy.as_deref()).await };
     let ffmpeg = ffmpeg_for_download(tools.ffmpeg.take(), managed_bin_dir(), options.install_ffmpeg, &cancel_flag, install).await;
@@ -5138,6 +5217,7 @@ async fn prepare(
         work_dir,
         version_cache: version_cache_file(),
         archive: archive_file(),
+        library: crate::music::library_file(),
         cookies: &BROWSER_COOKIES,
     };
     Ok((options, tools))
@@ -5156,6 +5236,8 @@ struct Tools<'a> {
     version_cache: Option<PathBuf>,
     /// See [`archive_file`].
     archive: Option<PathBuf>,
+    /// See `music::library_file`.
+    library: Option<PathBuf>,
     cookies: &'a BrowserCookies,
 }
 
@@ -5173,8 +5255,9 @@ async fn download_with(
     tools.cookies.files.get().await;
     let ffmpeg_dir = tools.ffmpeg.as_deref().and_then(Path::parent).map(Path::to_path_buf);
     // Audio presets convert with ffmpeg as yt-dlp's post-processor does, and clips, SponsorBlock
-    // and other containers are yt-dlp's too (see `MediaDownloadOptions::edits`).
-    let fast = fetch.filter(|_| !options.preset.extracts_audio() && !options.edits());
+    // and other containers are yt-dlp's too (see `MediaDownloadOptions::edits`), as is a song,
+    // whose cover yt-dlp embeds.
+    let fast = fetch.filter(|_| !options.preset.extracts_audio() && !options.edits() && options.music.is_none());
     let mut updated = false;
     loop {
         let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
@@ -5185,12 +5268,16 @@ async fn download_with(
         let result = 'attempt: {
             // What yt-dlp found, for it to download when the engine does not.
             let mut found = None;
-            // `options` with the subtitle languages as what yt-dlp found has them.
+            // `options` with the subtitle languages as what yt-dlp found has them, and a song
+            // placed by it.
             let mut regional = None;
-            // What yt-dlp found moments ago, else, for the engine to download, what it finds now.
+            // What yt-dlp found, of a song, for its lyrics.
+            let mut song = None;
+            // What yt-dlp found moments ago, else, for the engine to download or a song to be
+            // placed by, what it finds now.
             let json = match extracted.take() {
                 Some(Extracted(json)) => Some(json),
-                None if fast.is_some() => {
+                None if fast.is_some() || options.music.is_some() => {
                     let cookies = tools.cookies.for_run(&options.cookies).await.sign_in(options).await;
                     let run = run_to_end(command(Source::Url(url), RunKind::Extract, &cookies, options), cancel_flag.clone()).await;
                     if !is_cancelled(&cancel_flag) {
@@ -5217,6 +5304,7 @@ async fn download_with(
                         let asked = options.subtitles.as_deref();
                         let run_options = regional.insert(MediaDownloadOptions {
                             subtitles: asked.map(|asked| regional_langs(asked, &info)),
+                            music: options.music.as_ref().map(|music| crate::music::resolve(&info, music)),
                             ..options.clone()
                         });
                         let made = match fast {
@@ -5258,9 +5346,11 @@ async fn download_with(
                             // Found moments ago: yt-dlp downloads it as it is, where it can.
                             Err(FastError::Unsupported(why)) => {
                                 tracing::info!("Leaving {url} to yt-dlp: {why}");
-                                if loads_found(&info, options) {
+                                // A song's audio is one file, which fragments would not speed up.
+                                if loads_found(&info, options) || options.music.is_some() {
                                     found = tools.cookies.files.file(Some(json), "json").await.inspect_err(|e| tracing::debug!("{e}")).ok();
                                 }
+                                song = options.music.is_some().then_some(info);
                             }
                             // Maybe long after the extraction: the formats' URLs may have expired.
                             Err(FastError::Failed(e)) => tracing::info!("Leaving {url} to yt-dlp: {e}"),
@@ -5275,6 +5365,10 @@ async fn download_with(
             let result = run_ytdlp(command, progress_tx.as_ref(), cancel_flag.clone(), tools.ffmpeg.as_deref(), record).await;
             if !is_cancelled(&cancel_flag) {
                 cookies.finish(result.is_ok()).await;
+            }
+            if let (Ok((path, made)), Some(music)) = (&result, regional.as_ref().unwrap_or(options).music.as_ref()) {
+                let ids = made.iter().map(|(line, _)| line.clone()).collect();
+                song_downloaded(path, ids, music, song.as_ref(), options, tools.library.as_deref()).await;
             }
             result
         };
@@ -5315,6 +5409,37 @@ async fn download_with(
     }
 }
 
+/// After a song (see `MediaDownloadOptions::music`) was downloaded to `path`: the library index
+/// gets it under `ids` (its download archive lines), its playlist file names it in its place, and
+/// its synced lyrics are written next to it when asked for, from what yt-dlp found (`info`). A
+/// failure of any of these is only logged: the song itself is there.
+async fn song_downloaded(path: &Path, ids: Vec<String>, music: &crate::music::Music, info: Option<&Value>, options: &MediaDownloadOptions, library: Option<&Path>) {
+    if let Some(library) = library.map(Path::to_path_buf).filter(|_| !ids.is_empty()) {
+        let (song, playlist) = (path.to_path_buf(), music.playlist.clone());
+        let recorded = tokio::task::spawn_blocking(move || {
+            // Songs of one playlist finish together: one at a time writes the index and the playlist.
+            let _lock = crate::history::lock_file(&library)?;
+            crate::music::record_library(&library, &ids, &song)?;
+            match playlist {
+                Some(file) => crate::music::refresh_playlist(&file, &crate::music::read_library(&library)),
+                None => Ok(()),
+            }
+        });
+        if let Err(e) = recorded.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+            tracing::warn!("Could not add {} to the music library: {e}", path.display());
+        }
+    }
+    let Some(info) = info.filter(|_| options.lyrics) else { return };
+    match http_client(options.proxy.as_deref()) {
+        Ok(client) => {
+            if crate::music::lyrics(&client, crate::music::LRCLIB, info, music, path).await.is_none() {
+                tracing::info!("No synced lyrics for {}", path.display());
+            }
+        }
+        Err(e) => tracing::warn!("No lyrics for {}: {e}", path.display()),
+    }
+}
+
 /// What a media link holds, before it is downloaded (see [`info`]), as `POST /info` answers it.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct MediaInfo {
@@ -5343,6 +5468,9 @@ pub struct MediaInfo {
     /// Its video qualities and audio to choose from, read from the same answer; None for a list
     /// or a link without formats to choose from.
     pub qualities: Option<crate::quality::Qualities>,
+    /// Of a music link (see `music::kind`), what it is ("An album of 14 songs by ..."): it is
+    /// downloaded as audio into the music library.
+    pub music: Option<String>,
 }
 
 /// The list a media link names: its title and how many entries it has.
@@ -5378,7 +5506,14 @@ static INFO_FOUND: LazyLock<parking_lot::Mutex<HashMap<String, (tokio::time::Ins
 /// [`INFO_KEPT`], unless the list a video link names could not be read. Err is the sentence to
 /// show the user (see [`said`]).
 pub async fn info(url: &Url, cookies_path: Option<&Path>, proxy: Option<&str>) -> Result<MediaInfo, String> {
-    let key = info_key(url, cookies_path);
+    let cookies = cookies_path.map_or(BrowserCookieSource::None, |path| BrowserCookieSource::File(path.to_path_buf()));
+    info_as(url, &cookies, proxy).await
+}
+
+/// [`info`] read with `cookies`: a cookies file's, or a browser's, which a SoundCloud song's card
+/// needs to tell of the artist's original file.
+pub async fn info_as(url: &Url, cookies: &BrowserCookieSource, proxy: Option<&str>) -> Result<MediaInfo, String> {
+    let key = info_key(url, cookies);
     let kept = || INFO_FOUND.lock().get(&key).filter(|(at, _)| at.elapsed() < INFO_KEPT).map(|(_, info)| info.clone());
     if let Some(info) = kept() {
         return Ok(info);
@@ -5388,11 +5523,7 @@ pub async fn info(url: &Url, cookies_path: Option<&Path>, proxy: Option<&str>) -
     if let Some(info) = kept() {
         return Ok(info);
     }
-    let options = MediaDownloadOptions {
-        cookies: cookies_path.map_or(BrowserCookieSource::None, |path| BrowserCookieSource::File(path.to_path_buf())),
-        proxy: proxy.map(str::to_string),
-        ..Default::default()
-    };
+    let options = MediaDownloadOptions { cookies: cookies.clone(), proxy: proxy.map(str::to_string), ..Default::default() };
     let deadline = tokio::time::Instant::now() + FIND_TIMEOUT;
     let asked = async {
         let (options, tools) = prepare(&options, &None, false).await?;
@@ -5413,18 +5544,23 @@ pub async fn info(url: &Url, cookies_path: Option<&Path>, proxy: Option<&str>) -
 }
 
 /// What [`info`] keeps its answer about `url` by: the link and the SHA-256 of the cookies file
-/// it is read with, so that what a sign-in found goes only to a caller with that same sign-in.
-fn info_key(url: &Url, cookies_path: Option<&Path>) -> String {
-    let cookies = cookies_path.map(|path| std::fs::read(path).unwrap_or_default());
-    format!("{url} {}", cookies.map_or_else(String::new, |text| format!("{:x}", Sha256::digest(text))))
+/// it is read with, or the browser's name, so that what a sign-in found goes only to a caller
+/// with that same sign-in.
+fn info_key(url: &Url, cookies: &BrowserCookieSource) -> String {
+    match cookies {
+        BrowserCookieSource::File(path) => format!("{url} {:x}", Sha256::digest(std::fs::read(path).unwrap_or_default())),
+        other => format!("{url} {}", other.browser().unwrap_or_default()),
+    }
 }
 
 /// [`info`] with `tools`: the video `url` names, and the list it names, read until `deadline`.
 /// A video link that names its list too stands alone when the list cannot be read in time.
 async fn info_with(url: &Url, options: &MediaDownloadOptions, tools: &Tools<'_>, deadline: tokio::time::Instant) -> Result<MediaInfo, String> {
+    let music = crate::music::kind(url);
     let video = || async {
         let Extracted(json) = find_with(url, options, tools, None).await?;
-        serde_json::from_slice(&json).map(|found| media_info(&found)).map_err(|e| format!("yt-dlp printed what it found unreadably: {e}"))
+        let found: Value = serde_json::from_slice(&json).map_err(|e| format!("yt-dlp printed what it found unreadably: {e}"))?;
+        Ok::<_, String>(MediaInfo { music: music.map(|_| crate::music::song_sentence(&found)), ..media_info(&found) })
     };
     let Some(kind) = list_kind(url) else { return video().await };
     let one = video_in_playlist(url);
@@ -5437,6 +5573,8 @@ async fn info_with(url: &Url, options: &MediaDownloadOptions, tools: &Tools<'_>,
         Ok(Some(Ok((title, entries)))) => {
             if !one {
                 info.title = title.clone();
+                let first = entries.first().and_then(|entry| entry.music.as_ref());
+                info.music = music.map(|music| crate::music::list_sentence(music, &title, entries.len(), first));
             }
             info.playlist = Some(MediaPlaylist { title, count: entries.len() });
         }
@@ -5570,12 +5708,14 @@ pub(crate) mod tests {
             playlist: Some(MediaPlaylist { title: "List".into(), count: 42 }),
             sponsorblock: true,
             qualities: None,
+            music: Some("A song by Sample Artist".into()),
         };
         let expected = serde_json::json!({
             "title": "Talk", "uploader": "Channel", "duration": 213.0, "thumbnail": "https://i.example/t.jpg",
             "live": "was_live", "heights": [2160, 1080, 720], "hdr": [2160], "fps60": [1080], "audio": true,
             "subtitles": ["en", "es"], "auto_subtitles": ["en"], "chapters": 12,
             "playlist": {"title": "List", "count": 42}, "sponsorblock": true, "qualities": null,
+            "music": "A song by Sample Artist",
         });
         assert_eq!(serde_json::to_value(&info).unwrap(), expected);
         let none = serde_json::to_value(MediaInfo::default()).unwrap();
@@ -5631,6 +5771,7 @@ pub(crate) mod tests {
             playlist: None,
             sponsorblock: true,
             qualities: crate::quality::Qualities::of(&zoo_video()),
+            music: None,
         };
         assert_eq!(media_info(&zoo_video()), expected);
         // From the same answer: the HDR 1080p, the 240p in two codecs, the 144p; not the locked 2160p.
@@ -5698,6 +5839,7 @@ pub(crate) mod tests {
             work_dir: dir.path().to_path_buf(),
             version_cache: None,
             archive: None,
+            library: None,
             cookies: &cookies,
         };
         let cookies_file = BrowserCookieSource::File(dir.path().join("cookies.txt"));
@@ -5733,14 +5875,18 @@ pub(crate) mod tests {
         std::fs::write(&file, "# Netscape HTTP Cookie File
 .youtube.com	TRUE	/	TRUE	0	SID	mine
 ").unwrap();
-        let signed_in = info_key(&url, Some(&file));
-        assert_eq!(info_key(&url, Some(&file)), signed_in);
-        assert_ne!(info_key(&url, None), signed_in);
-        assert_ne!(info_key(&other, Some(&file)), signed_in);
+        let signed = BrowserCookieSource::File(file.clone());
+        let signed_in = info_key(&url, &signed);
+        // A browser's sign-in is kept apart from the file's, and from none.
+        let edge = info_key(&url, &BrowserCookieSource::Edge);
+        assert!(edge != signed_in && edge != info_key(&url, &BrowserCookieSource::None), "{edge}");
+        assert_eq!(info_key(&url, &signed), signed_in);
+        assert_ne!(info_key(&url, &BrowserCookieSource::None), signed_in);
+        assert_ne!(info_key(&other, &signed), signed_in);
         std::fs::write(&file, "# Netscape HTTP Cookie File
 .youtube.com	TRUE	/	TRUE	0	SID	junk
 ").unwrap();
-        assert_ne!(info_key(&url, Some(&file)), signed_in);
+        assert_ne!(info_key(&url, &signed), signed_in);
         assert!(!signed_in.contains("mine"), "{signed_in}");
     }
 
@@ -8076,6 +8222,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             work_dir: dir.to_path_buf(),
             version_cache: None,
             archive: None,
+            library: Some(dir.join("library.txt")),
             cookies,
         };
         let options = MediaDownloadOptions { output_dir: out, ..options };
@@ -8306,6 +8453,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             work_dir: dir.path().to_path_buf(),
             version_cache: None,
             archive: None,
+            library: None,
             cookies: &cookies,
         };
         let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("yt-dlp downloads DASH fragments");
@@ -8830,7 +8978,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
     /// streamer's daily VODs) are two files in the list's folder; nothing new is nothing to do.
     #[test]
     fn only_new_items_are_listed_each_into_a_folder_named_after_the_list() {
-        let entry = |link: &str, id: Option<&str>| ListEntry { url: Url::parse(link).unwrap(), archive_id: id.map(str::to_string) };
+        let entry = |link: &str, id: Option<&str>| ListEntry { url: Url::parse(link).unwrap(), archive_id: id.map(str::to_string), music: None };
         let entries = || {
             vec![
                 entry("https://www.youtube.com/watch?v=a", Some("youtube a")),
@@ -8860,7 +9008,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
     #[test]
     fn list_entries_are_links_the_list_chose() {
         let entries = ["https://artist-one.bandcamp.com/album/first", "https://artist-two.bandcamp.com/track/second"]
-            .map(|link| ListEntry { url: Url::parse(link).unwrap(), archive_id: None });
+            .map(|link| ListEntry { url: Url::parse(link).unwrap(), archive_id: None, music: None });
         let tasks = list_tasks(("Label".to_string(), entries.into()), None);
         assert_eq!(tasks.len(), 2);
         assert!(tasks.iter().all(|task| task.from_document), "{tasks:?}");
@@ -8999,6 +9147,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
                 work_dir: dir.path().to_path_buf(),
                 version_cache: None,
                 archive: Some(archive.clone()),
+                library: None,
                 cookies: &cookies,
             };
             Ok((MediaDownloadOptions { output_dir: dir.path().to_path_buf(), ..Default::default() }, tools))
@@ -9046,6 +9195,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             work_dir: dir.path().to_path_buf(),
             version_cache: None,
             archive: Some(archive.clone()),
+            library: None,
             cookies: &cookies,
         };
         let prepared = std::future::ready(Ok((MediaDownloadOptions { output_dir: dir.path().to_path_buf(), ..Default::default() }, tools)));
@@ -9078,6 +9228,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             work_dir: dir.to_path_buf(),
             version_cache: None,
             archive: Some(archive.clone()),
+            library: None,
             cookies: &cookies,
         };
         let options = MediaDownloadOptions { output_dir: out, ..Default::default() };
@@ -10145,5 +10296,141 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         // Without a console, and with Ctrl+C ignored.
         let status = gui.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).status().await.unwrap();
         assert!(status.success(), "{status}");
+    }
+
+    /// yt-dlp's flat listing of a YouTube Music album, as its real answers have it.
+    fn music_album() -> Value {
+        let song = |n: usize, title: &str| {
+            serde_json::json!({"_type": "url", "ie_key": "Youtube", "id": format!("aaaaaaaaaa{n}"), "url": format!("https://music.youtube.com/watch?v=aaaaaaaaaa{n}"),
+                   "title": title, "channel": "Sample Artist - Topic", "duration": 200 + n})
+        };
+        serde_json::json!({"_type": "playlist", "id": "OLAK5uy_sample", "title": "Album - Sample Album", "extractor_key": "YoutubeTab",
+               "entries": [song(1, "First Song"), song(2, "Second Song"), song(3, "Third Song")]})
+    }
+
+    #[test]
+    fn a_music_albums_songs_are_numbered_in_its_order() {
+        let tracks: Vec<_> = list_entries(&music_album(), true)
+            .into_iter()
+            .map(|listed| match listed {
+                Listed::Entry(entry) => entry.music.unwrap(),
+                Listed::Nested(url) => panic!("{url} is a song"),
+            })
+            .collect();
+        let album = |track| crate::music::Music {
+            track: Some(track),
+            album: Some("Sample Album".into()),
+            album_artist: Some("Sample Artist".into()),
+            ..Default::default()
+        };
+        assert_eq!(tracks, [album(1), album(2), album(3)]);
+        // Another playlist of songs numbers none; a video playlist is no music.
+        let mut mix = music_album();
+        mix["id"] = "PLsample".into();
+        assert!(list_entries(&mix, true).iter().all(|listed| matches!(listed, Listed::Entry(entry) if entry.music == Some(Default::default()))));
+        assert!(list_entries(&music_album(), false).iter().all(|listed| matches!(listed, Listed::Entry(entry) if entry.music.is_none())));
+        // An album's and an artist's pages are lists yt-dlp reads.
+        for link in ["https://music.youtube.com/browse/MPREb_sample", "https://music.youtube.com/channel/UCsample"] {
+            assert!(lists(&Url::parse(link).unwrap()), "{link}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_music_list_downloads_what_the_library_lacks_and_writes_its_playlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("Sample Artist").join("First Song.opus");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"audio").unwrap();
+        let library = dir.path().join("library.txt");
+        crate::music::record_library(&library, &["youtube aaaaaaaaaa1".to_string()], &first).unwrap();
+        // The third was downloaded once, and its file is gone since.
+        crate::music::record_library(&library, &["youtube aaaaaaaaaa3".to_string()], &dir.path().join("gone.opus")).unwrap();
+        let mut mix = music_album();
+        mix["id"] = "PLsample".into();
+        mix["title"] = "Road Trip".into();
+        // Only new songs, whatever the setting says.
+        let options = crate::ingest::ListOptions { save_dir: Some(dir.path().to_path_buf()), only_new: false, ..Default::default() };
+        let listed = ("Road Trip".to_string(), list_entries_flat(&mix));
+        let tasks = music_listed(crate::music::Kind::Playlist, listed, &options, Some(library.clone())).await.unwrap();
+        let playlist = dir.path().join("Road Trip.m3u8");
+        let links: Vec<&str> = tasks.iter().map(|task| task.urls[0].as_str()).collect();
+        assert_eq!(links, ["https://music.youtube.com/watch?v=aaaaaaaaaa2", "https://music.youtube.com/watch?v=aaaaaaaaaa3"]);
+        for task in &tasks {
+            assert_eq!((task.folder.as_ref(), task.media_name.as_ref()), (None, None), "the library places it");
+            assert_eq!(task.music.as_ref().and_then(|music| music.playlist.as_ref()), Some(&playlist));
+        }
+        let text = std::fs::read_to_string(&playlist).unwrap();
+        assert!(text.starts_with("#EXTM3U\n#PLAYLIST:Road Trip\n# youtube aaaaaaaaaa1\nSample Artist/First Song.opus\n# youtube aaaaaaaaaa2\n"), "{text}");
+        // An album is its folder: no playlist file, and its songs keep their places.
+        std::fs::remove_file(&playlist).unwrap();
+        let listed = ("Album - Sample Album".to_string(), list_entries_flat(&music_album()));
+        let tasks = music_listed(crate::music::Kind::Album, listed, &options, Some(library)).await.unwrap();
+        assert_eq!(tasks.iter().map(|task| task.music.as_ref().unwrap().track).collect::<Vec<_>>(), [Some(2), Some(3)]);
+        assert!(tasks.iter().all(|task| task.music.as_ref().unwrap().playlist.is_none()) && !playlist.exists());
+    }
+
+    /// The entries `list_entries` makes of a music list.
+    fn list_entries_flat(info: &Value) -> Vec<ListEntry> {
+        list_entries(info, true)
+            .into_iter()
+            .filter_map(|listed| match listed {
+                Listed::Entry(entry) => Some(entry),
+                Listed::Nested(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_songs_download_is_audio_placed_in_the_library() {
+        let out = std::env::temp_dir().join("hf-music-out");
+        let music = crate::music::Music {
+            track: Some(2),
+            album: Some("Sample Album".into()),
+            album_artist: Some("Sample Artist".into()),
+            year: Some(2001),
+            playlist: None,
+        };
+        let pick = crate::quality::MediaPick { audio: Some(crate::quality::AudioForm::Original), ..Default::default() };
+        let options = MediaDownloadOptions {
+            preset: MediaQualityPreset::Pick(pick),
+            output_dir: out.clone(),
+            output_filename: Some("ignored.%(ext)s".into()),
+            embed_metadata: false,
+            music: Some(music),
+            ..Default::default()
+        };
+        let url = Url::parse("https://music.youtube.com/watch?v=aaaaaaaaaa2").unwrap();
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], Some(Path::new("/ffmpeg")), None, None);
+        let has = |arg: &str| args.iter().any(|a| a == arg);
+        assert!(has("-x") && has("--embed-thumbnail") && has("--embed-metadata") && has("--parse-metadata"), "{args:?}");
+        let to = args.windows(2).find(|w| w[0] == "-o").map(|w| w[1].clone()).unwrap();
+        let want = out.join("Sample Artist").join("Sample Album (2001)").join("02 %(track,title)s.%(ext)s");
+        assert_eq!(to, template_literal(&out.to_string_lossy()) + &want.to_string_lossy()[out.to_string_lossy().len()..]);
+        // Finding it asks for neither conversion nor tags.
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Extract, &[], Some(Path::new("/ffmpeg")), None, None);
+        assert!(!args.iter().any(|a| a == "-x" || a == "--parse-metadata"), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn a_song_is_found_first_then_downloaded_as_found_and_joins_its_playlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("a song is yt-dlp's to download");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // A playlist the song is in, written when it was listed (the stand-in names it so).
+        let playlist = out.join("Road Trip.m3u8");
+        crate::music::write_playlist(&playlist, "Road Trip", &["vimeo 76979871".to_string()], &HashMap::new()).unwrap();
+        let mut info = youtube_info(&out);
+        (info["artist"], info["album"], info["release_year"]) = ("Sample Artist".into(), "Sample Album".into(), 2001.into());
+        let music = crate::music::Music { playlist: Some(playlist.clone()), ..Default::default() };
+        let options = MediaDownloadOptions { music: Some(music), ..Default::default() };
+        let path = fake_download_with(dir.path(), &info, &cookies, fetch, options).await.unwrap();
+        // Found once: a YouTube song too is downloaded from what was found.
+        assert_eq!(runs_in(dir.path()), ["extract", "download info"]);
+        let library = crate::music::read_library(&dir.path().join("library.txt"));
+        assert_eq!(library.get("vimeo 76979871"), Some(&path));
+        let text = std::fs::read_to_string(&playlist).unwrap();
+        assert!(text.contains("# vimeo 76979871\nclip.mp4\n"), "{text}");
     }
 }
