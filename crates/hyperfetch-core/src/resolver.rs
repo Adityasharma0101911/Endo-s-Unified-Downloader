@@ -574,8 +574,18 @@ impl AnnaArchiveResolver {
         request = request.header(reqwest::header::REFERER, "https://annas-archive.gl/");
 
         let resp = request.send().await?;
-        if !resp.status().is_success() {
-            return Err(ResolverError::NotFound(format!("Anna's Archive returned HTTP {}", resp.status())));
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        if !status.is_success() {
+            let snippet = read_capped(resp, 8192).await.unwrap_or_default();
+            if let Some(challenge) = detect_anti_bot_challenge(status, &headers, &snippet) {
+                return Err(ResolverError::BrowserClearanceRequired {
+                    host: url.host_str().unwrap_or_default().to_string(),
+                    url: url.to_string(),
+                    message: challenge.to_string(),
+                });
+            }
+            return Err(ResolverError::NotFound(format!("Anna's Archive returned HTTP {}", status)));
         }
 
         let html = read_capped(resp, MAX_HTML_BYTES).await?;
@@ -842,6 +852,7 @@ impl HostResolver for AnnaArchiveResolver {
         let (cookie_header, user_agent) = extract_browser_cookies_for_domain(url.host_str().unwrap_or(""));
 
         let mut candidates = Vec::new();
+        let mut clearance_err = None;
 
         // 1. Extract MD5 from the URL (works for /md5/, /slow_download/, or query parameters)
         let md5 = Self::extract_md5(url);
@@ -855,13 +866,54 @@ impl HostResolver for AnnaArchiveResolver {
                 candidates.push(fast_url);
             }
 
-            // 1b. Fetch book metadata page (/md5/<MD5>) to find IPFS CIDs and external mirrors
-            let book_url_str = format!("{}://{}/md5/{}", url.scheme(), host, md5_hash);
-            if let Ok(book_url) = Url::parse(&book_url_str) {
-                if let Ok(book_candidates) = Self::resolve_book_page(client, &book_url, cookie_header.as_deref(), user_agent.as_deref()).await {
-                    for c in book_candidates {
-                        if !candidates.contains(&c) {
-                            candidates.push(c);
+            // 1b. Fetch book metadata page (/md5/<MD5>) to find IPFS CIDs and external mirrors, trying mirror domains
+            let mut hosts_to_try = vec![host];
+            for alt in ["annas-archive.gd", "annas-archive.pk", "annas-archive.se", "annas-archive.pm", "annas-archive.org"] {
+                if !alt.eq_ignore_ascii_case(host) {
+                    hosts_to_try.push(alt);
+                }
+            }
+
+            for try_host in hosts_to_try {
+                let book_url_str = format!("{}://{}/md5/{}", url.scheme(), try_host, md5_hash);
+                if let Ok(book_url) = Url::parse(&book_url_str) {
+                    match Self::resolve_book_page(client, &book_url, cookie_header.as_deref(), user_agent.as_deref()).await {
+                        Ok(book_candidates) => {
+                            for c in book_candidates {
+                                if !candidates.contains(&c) {
+                                    candidates.push(c);
+                                }
+                            }
+                            if !candidates.is_empty() {
+                                break;
+                            }
+                        }
+                        Err(ResolverError::BrowserClearanceRequired { host: h, url: u, message: m }) => {
+                            if clearance_err.is_none() {
+                                clearance_err = Some(ResolverError::BrowserClearanceRequired { host: h, url: u, message: m });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // 1c. If candidates are still empty, try resolving the MD5 directly against LibGen / library.lol
+            if candidates.is_empty() {
+                let libgen_endpoints = ["https://library.lol/main/", "https://libgen.is/get.php?md5=", "https://libgen.li/ads.php?md5="];
+                for base in libgen_endpoints {
+                    if let Ok(target) = Url::parse(&format!("{base}{md5_hash}")) {
+                        if LibGenResolver.can_handle(&target) {
+                            if let Ok(Ok(resolved)) = tokio::time::timeout(Duration::from_secs(5), LibGenResolver.resolve(client, &target)).await {
+                                for c in resolved {
+                                    if !candidates.contains(&c) {
+                                        candidates.push(c);
+                                    }
+                                }
+                                if !candidates.is_empty() {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -909,6 +961,10 @@ impl HostResolver for AnnaArchiveResolver {
                     }
                 }
             }
+        }
+
+        if let Some(err) = clearance_err {
+            return Err(err);
         }
 
         Ok(vec![url.clone()])
@@ -1294,7 +1350,13 @@ pub fn detect_anti_bot_challenge(status: reqwest::StatusCode, headers: &HeaderMa
     if headers.get("cf-mitigated").and_then(|v| v.to_str().ok()) == Some("challenge") {
         return Some("Cloudflare Turnstile challenge");
     }
+    if headers.get("server").and_then(|v| v.to_str().ok()).is_some_and(|s| s.eq_ignore_ascii_case("ddos-guard")) {
+        return Some("DDoS-Guard anti-bot verification challenge");
+    }
     if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        if body_snippet.contains("ddos-guard") || body_snippet.contains("check.ddos-guard.net") {
+            return Some("DDoS-Guard anti-bot verification challenge");
+        }
         if body_snippet.contains("challenges.cloudflare.com/turnstile") || body_snippet.contains("cf-turnstile-wrapper") {
             return Some("Cloudflare Turnstile verification challenge");
         }
