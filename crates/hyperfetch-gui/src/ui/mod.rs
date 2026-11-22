@@ -235,7 +235,7 @@ fn visuals(theme: Theme, p: Palette) -> egui::Visuals {
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = p.bg;
     v.window_fill = p.card;
-    v.window_stroke = Stroke::new(1.0, p.border);
+    v.window_stroke = Stroke::new(1.0_f32, p.border);
     v.window_rounding = egui::Rounding::same(14.0);
     v.menu_rounding = egui::Rounding::same(10.0);
     let shade = Color32::from_black_alpha(if dark { 110 } else { 38 });
@@ -245,9 +245,9 @@ fn visuals(theme: Theme, p: Palette) -> egui::Visuals {
     v.faint_bg_color = p.field;
     v.hyperlink_color = p.link;
     v.slider_trailing_fill = true;
-    v.text_cursor.stroke = Stroke::new(2.0, p.link);
+    v.text_cursor.stroke = Stroke::new(2.0_f32, p.link);
     v.selection.bg_fill = p.accent.gamma_multiply(if dark { 0.55 } else { 0.22 });
-    v.selection.stroke = Stroke::new(1.0, p.link);
+    v.selection.stroke = Stroke::new(1.0_f32, p.link);
     let w = &mut v.widgets;
     for (state, fill, stroke, text) in [
         (&mut w.noninteractive, p.card, p.border, p.text),
@@ -258,8 +258,8 @@ fn visuals(theme: Theme, p: Palette) -> egui::Visuals {
     ] {
         state.bg_fill = fill;
         state.weak_bg_fill = fill;
-        state.bg_stroke = Stroke::new(1.0, stroke);
-        state.fg_stroke = Stroke::new(1.0, text);
+        state.bg_stroke = Stroke::new(1.0_f32, stroke);
+        state.fg_stroke = Stroke::new(1.0_f32, text);
         state.rounding = egui::Rounding::same(8.0);
     }
     v
@@ -283,7 +283,7 @@ fn card_shadow(ui: &Ui, lift: f32) -> egui::Shadow {
 
 fn card(ui: &Ui) -> Frame {
     let p = palette(ui);
-    Frame::none().fill(p.card).stroke(Stroke::new(1.0, p.border)).inner_margin(18.0).rounding(14.0).shadow(card_shadow(ui, 0.0))
+    Frame::none().fill(p.card).stroke(Stroke::new(1.0_f32, p.border)).inner_margin(18.0).rounding(14.0).shadow(card_shadow(ui, 0.0))
 }
 
 /// A button in `fill` with text that reads on it (see [`eased_button`]).
@@ -310,7 +310,7 @@ fn eased_button(ui: &mut Ui, button: egui::Button<'static>, fill: Option<Color32
         Some(fill) => (fill, fill.lerp_to_gamma(Color32::WHITE, 0.14), Stroke::NONE),
         None => {
             let stroke = w.inactive.bg_stroke.color.lerp_to_gamma(w.hovered.bg_stroke.color, hover);
-            (w.inactive.weak_bg_fill, w.hovered.weak_bg_fill, Stroke::new(1.0, stroke))
+            (w.inactive.weak_bg_fill, w.hovered.weak_bg_fill, Stroke::new(1.0_f32, stroke))
         }
     };
     let color = rest.lerp_to_gamma(lit, hover).lerp_to_gamma(Color32::BLACK, 0.12 * press);
@@ -448,7 +448,7 @@ fn keyed_banner(ui: &mut Ui, id: egui::Id, color: Color32, glyph: &str, text: im
     anim::shifted(ui, anim::ease(t), anim::DROP, |ui| {
         Frame::none()
             .fill(p.card.lerp_to_gamma(color, 0.1))
-            .stroke(Stroke::new(1.0, color.gamma_multiply(0.45)))
+            .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.45)))
             .inner_margin(Margin::symmetric(14.0, 9.0))
             .rounding(12.0)
             .shadow(card_shadow(ui, 0.0))
@@ -558,7 +558,7 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
     sidebar(app, ctx);
     let beside = wide(ctx) && app.tab == Tab::Downloads;
     if let Some(item) = app.focused_item().cloned().filter(|_| beside) {
-        let frame = Frame::none().fill(p.card).inner_margin(Margin::symmetric(20.0, 18.0)).stroke(Stroke::new(1.0, p.border));
+        let frame = Frame::none().fill(p.card).inner_margin(Margin::symmetric(20.0, 18.0)).stroke(Stroke::new(1.0_f32, p.border));
         egui::SidePanel::right("detail").resizable(false).exact_width(440.0).frame(frame).show(ctx, |ui| {
             egui::ScrollArea::vertical().id_salt("detail scroll").auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_max_width(ui.available_width() - 8.0);
@@ -815,7 +815,7 @@ fn spark(ui: &mut Ui, speeds: &[f64; 60], live: bool) {
     }
     ui.painter().add(egui::Shape::mesh(mesh));
     let line = if live { p.link } else { p.dim.gamma_multiply(0.6) };
-    ui.painter().add(egui::Shape::line(points.clone(), Stroke::new(1.5, line)));
+    ui.painter().add(egui::Shape::line(points.clone(), Stroke::new(1.5_f32, line)));
     if live {
         if let Some(&last) = points.last() {
             ui.painter().circle_filled(last, 4.0, p.link.gamma_multiply(0.3));
@@ -977,8 +977,8 @@ fn focus_ring(ctx: &egui::Context) {
     let p = palette_of(ctx);
     let shown = anim::glide_rect(ctx, egui::Id::new("focus ring"), rect);
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("focus ring")));
-    painter.rect_stroke(shown.expand(2.0), 12.0, Stroke::new(4.0, p.link.gamma_multiply(0.18)));
-    painter.rect_stroke(shown, 10.0, Stroke::new(2.0, p.link));
+    painter.rect_stroke(shown.expand(2.0), 12.0, Stroke::new(4.0_f32, p.link.gamma_multiply(0.18)));
+    painter.rect_stroke(shown, 10.0, Stroke::new(2.0_f32, p.link));
 }
 
 /// Ctrl+1 to Ctrl+4 (⌘ on macOS) switch pages and Ctrl+K opens the palette; outside a text box,

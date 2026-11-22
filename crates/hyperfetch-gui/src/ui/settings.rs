@@ -1122,7 +1122,7 @@ fn accounts_and_tools(app: &mut App, ui: &mut Ui) {
     if let Some(service) = signing {
         // The sign-in as a card of numbered steps under the rows.
         ui.add_space(8.0);
-        let frame = egui::Frame::none().fill(p.card).stroke(Stroke::new(1.0, p.border)).rounding(12.0).inner_margin(Margin::same(14.0));
+        let frame = egui::Frame::none().fill(p.card).stroke(Stroke::new(1.0_f32, p.border)).rounding(12.0).inner_margin(Margin::same(14.0));
         frame.show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(format!("{}  Sign in to {}", icon::KEY, service.name())).strong().color(p.text));

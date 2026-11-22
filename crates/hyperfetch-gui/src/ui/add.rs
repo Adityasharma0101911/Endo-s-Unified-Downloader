@@ -122,7 +122,7 @@ pub(super) fn undo_toast(app: &mut App, ctx: &egui::Context) {
     egui::Area::new(id).order(egui::Order::Foreground).anchor(Align2::CENTER_BOTTOM, rise).interactable(live).show(ctx, |ui| {
         ui.multiply_opacity(shown);
         let shadow = egui::Shadow { offset: Vec2::new(0.0, 6.0), blur: 18.0, spread: 0.0, color: Color32::from_black_alpha(70) };
-        Frame::none().fill(p.card).stroke(Stroke::new(1.0, p.border)).rounding(10.0).shadow(shadow).inner_margin(Margin::symmetric(14.0, 8.0)).show(ui, |ui| {
+        Frame::none().fill(p.card).stroke(Stroke::new(1.0_f32, p.border)).rounding(10.0).shadow(shadow).inner_margin(Margin::symmetric(14.0, 8.0)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon::TRASH).size(16.0).color(p.muted));
                 ui.label(RichText::new(text).color(p.text));
@@ -330,7 +330,7 @@ pub(super) fn drop_zone(ctx: &egui::Context) {
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop zone")));
     let zone = ctx.screen_rect().shrink(16.0 + 4.0 * pulse);
     painter.rect_filled(ctx.screen_rect(), 0.0, p.bg.gamma_multiply(0.88 * shown));
-    let edge = Stroke::new(2.0, p.accent.gamma_multiply((0.55 + 0.45 * pulse) * shown));
+    let edge = Stroke::new(2.0_f32, p.accent.gamma_multiply((0.55 + 0.45 * pulse) * shown));
     painter.rect(zone, 14.0, p.accent.gamma_multiply(0.06 * shown), edge);
     let center = zone.center() - Vec2::new(0.0, 22.0 + 6.0 * pulse);
     anim::paint_icon(&painter, center, icon::FILE_ARROW_DOWN, 52.0, p.accent.gamma_multiply(shown), 0.0);
@@ -1102,7 +1102,7 @@ fn download_button(app: &App, ui: &mut Ui) -> egui::Response {
     let left = response.rect.center().x - width(label) / 2.0;
     let room = width(label) - width("Added");
     let check = Rect::from_center_size(Pos2::new(left + room / 2.0 - 1.0, response.rect.center().y), Vec2::splat(15.0));
-    anim::paint_check(ui.painter(), check, anim::ease(added * 3.0), Stroke::new(2.0, Color32::WHITE));
+    anim::paint_check(ui.painter(), check, anim::ease(added * 3.0), Stroke::new(2.0_f32, Color32::WHITE));
     response
 }
 

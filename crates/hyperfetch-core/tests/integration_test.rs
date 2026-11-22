@@ -331,7 +331,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
 
     let (reply, _guard) = if probe {
         s.probes.fetch_add(1, Ordering::SeqCst);
-        let busy = mock.busy_probes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+        let busy = mock.busy_probes.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
         (if busy { Reply::Status(503, mock.busy_retry_after) } else { mock.probe_reply }, None)
     } else {
         let index = s.gets.fetch_add(1, Ordering::SeqCst);
@@ -4316,6 +4316,23 @@ async fn test_anna_archive_resolution_and_fallback_racing() {
     assert_eq!(mirrors.len(), 2);
     assert!(mirrors.iter().any(|u| u.as_str().contains("library.lol")));
     assert!(mirrors.iter().any(|u| u.as_str().contains("libgen.li")));
+
+    // Test that a slow_download URL's MD5 is correctly extracted to bypass countdown queues
+    let slow_url = Url::parse("https://annas-archive.gl/slow_download/8f07ef504d743288f62539da685d2543/0/0").unwrap();
+    let md5 = hyperfetch_core::resolver::AnnaArchiveResolver::extract_md5(&slow_url);
+    assert_eq!(md5.as_deref(), Some("8f07ef504d743288f62539da685d2543"));
+
+    // Test LibGen direct resolution from library.lol
+    let lol_url = Url::parse("https://library.lol/main/8f07ef504d743288f62539da685d2543").unwrap();
+    let lol_html = r#"
+        <div id="download">
+            <h2><a href="https://download.library.lol/main/123000/8f07ef504d743288f62539da685d2543/book.pdf">GET</a></h2>
+            <a href="https://ipfs.io/ipfs/bafykic733b5c3j26425a4d654274c5d63f25d62547d6e5c4b3a2a1z9y8x7w6">IPFS</a>
+        </div>
+    "#;
+    let resolved = hyperfetch_core::resolver::LibGenResolver::extract_download_links(lol_html, &lol_url);
+    assert!(!resolved.is_empty());
+    assert_eq!(resolved[0].as_str(), "https://download.library.lol/main/123000/8f07ef504d743288f62539da685d2543/book.pdf");
 }
 
 #[tokio::test]

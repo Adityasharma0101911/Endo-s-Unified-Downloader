@@ -334,38 +334,82 @@ impl AnnaArchiveResolver {
         url.path().contains("/slow_download/")
     }
 
-    /// Extracts IPFS CID from HTML content (v0 Qm... or v1 bafy...).
-    pub fn extract_ipfs_cid(html: &str) -> Option<String> {
-        // 1. Look for ipfs://<CID>
-        if let Some(idx) = html.find("ipfs://") {
-            let sub = &html[idx + 7..];
-            let cid: String = sub.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-            if is_valid_ipfs_cid(&cid) {
-                return Some(cid);
+    /// Validates whether a string is a 32-character hexadecimal MD5 hash.
+    pub fn is_valid_md5(s: &str) -> bool {
+        s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// Extracts 32-char hex MD5 from any Anna's Archive (or mirror) URL.
+    pub fn extract_md5(url: &Url) -> Option<String> {
+        if let Some(segments) = url.path_segments() {
+            let segs: Vec<&str> = segments.collect();
+            for i in 0..segs.len() {
+                if (segs[i].eq_ignore_ascii_case("md5") || segs[i].eq_ignore_ascii_case("slow_download")) && i + 1 < segs.len() {
+                    let candidate = segs[i + 1].to_ascii_lowercase();
+                    if Self::is_valid_md5(&candidate) {
+                        return Some(candidate);
+                    }
+                }
             }
+            for seg in &segs {
+                let seg_lower = seg.to_ascii_lowercase();
+                if Self::is_valid_md5(&seg_lower) {
+                    return Some(seg_lower);
+                }
+            }
+        }
+        for (k, v) in url.query_pairs() {
+            if k.eq_ignore_ascii_case("md5") {
+                let v_lower = v.to_ascii_lowercase();
+                if Self::is_valid_md5(&v_lower) {
+                    return Some(v_lower);
+                }
+            }
+        }
+        None
+    }
+
+    /// Extracts all unique valid IPFS CIDs from HTML content (v0 Qm... or v1 bafy...).
+    pub fn extract_ipfs_cids(html: &str) -> Vec<String> {
+        let mut cids = Vec::new();
+        let mut add_cid = |cid: &str| {
+            if is_valid_ipfs_cid(cid) && !cids.contains(&cid.to_string()) {
+                cids.push(cid.to_string());
+            }
+        };
+
+        // 1. Look for ipfs://<CID>
+        let mut from = 0;
+        while let Some(idx) = html[from..].find("ipfs://") {
+            let start = from + idx + 7;
+            let sub = &html[start..];
+            let cid: String = sub.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            add_cid(&cid);
+            from = start + cid.len();
         }
 
         // 2. Look for /ipfs/<CID>
-        let mut from = 0;
+        from = 0;
         while let Some(idx) = html[from..].find("/ipfs/") {
             let start = from + idx + 6;
             let sub = &html[start..];
             let cid: String = sub.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-            if is_valid_ipfs_cid(&cid) {
-                return Some(cid);
-            }
-            from = start;
+            add_cid(&cid);
+            from = start + cid.len();
         }
 
         // 3. Scan tokens in quotes or tags for valid CIDs
         for word in html.split(|c: char| c == '"' || c == '\'' || c == '<' || c == '>' || c.is_ascii_whitespace()) {
             let cleaned = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            if is_valid_ipfs_cid(cleaned) {
-                return Some(cleaned.to_string());
-            }
+            add_cid(cleaned);
         }
 
-        None
+        cids
+    }
+
+    /// Extracts the first IPFS CID from HTML content (backwards-compatible helper).
+    pub fn extract_ipfs_cid(html: &str) -> Option<String> {
+        Self::extract_ipfs_cids(html).into_iter().next()
     }
 
     /// Constructs high-speed public IPFS CDN gateway URLs for racing from a CID.
@@ -471,6 +515,91 @@ impl AnnaArchiveResolver {
 
         None
     }
+
+    /// Resolves via Anna's Archive Fast Download API if an API key is configured.
+    pub async fn resolve_fast_api(client: &Client, host: &str, md5: &str) -> Option<Url> {
+        let key = std::env::var("ANNAS_SECRET_KEY")
+            .or_else(|_| std::env::var("ANNAS_ARCHIVE_KEY"))
+            .ok()?;
+        let key = key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let api_url = format!("https://{}/dyn/api/fast_download.json?md5={}&key={}", host, md5, key);
+        let resp = client.get(&api_url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?;
+        #[derive(Deserialize)]
+        struct FastResp {
+            download_url: Option<String>,
+        }
+        let parsed: FastResp = serde_json::from_slice(&bytes).ok()?;
+        parsed.download_url.and_then(|u| Url::parse(&u).ok())
+    }
+
+    /// Resolves a book metadata page (/md5/<MD5>) into fast IPFS and LibGen mirrors.
+    pub async fn resolve_book_page(
+        client: &Client,
+        url: &Url,
+        cookie_header: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<Vec<Url>, ResolverError> {
+        let mut request = client.get(url.clone());
+        if let Some(c) = cookie_header {
+            if let Ok(hv) = HeaderValue::from_str(c) {
+                request = request.header(reqwest::header::COOKIE, hv);
+            }
+        }
+        if let Some(ua) = user_agent {
+            if let Ok(hv) = HeaderValue::from_str(ua) {
+                request = request.header(reqwest::header::USER_AGENT, hv);
+            }
+        }
+        request = request.header(reqwest::header::REFERER, "https://annas-archive.gl/");
+
+        let resp = request.send().await?;
+        if !resp.status().is_success() {
+            return Err(ResolverError::NotFound(format!("Anna's Archive returned HTTP {}", resp.status())));
+        }
+
+        let html = read_capped(resp, MAX_HTML_BYTES).await?;
+        let mut candidates = Vec::new();
+
+        // 1. IPFS Gateways
+        for cid in Self::extract_ipfs_cids(&html) {
+            tracing::info!("Anna's Archive: extracted IPFS CID {}", cid);
+            for gw in Self::construct_gateway_urls(&cid) {
+                if !candidates.contains(&gw) {
+                    candidates.push(gw);
+                }
+            }
+        }
+
+        // 2. External Mirrors (LibGen, library.lol, etc.)
+        let mirrors = Self::extract_external_mirrors(&html, url);
+        if !mirrors.is_empty() {
+            tracing::info!("Anna's Archive: extracted {} external mirrors", mirrors.len());
+            for mirror in mirrors {
+                if LibGenResolver.can_handle(&mirror) {
+                    if let Ok(Ok(resolved_links)) = tokio::time::timeout(Duration::from_secs(5), LibGenResolver.resolve(client, &mirror)).await {
+                        for link in resolved_links {
+                            if !candidates.contains(&link) {
+                                candidates.push(link);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if !candidates.contains(&mirror) {
+                    candidates.push(mirror);
+                }
+            }
+        }
+
+        Ok(candidates)
+    }
 }
 
 /// Validates whether a token matches IPFS v0 (Qm... 46 chars) or v1 (bafy/bafk... 52-120 chars) specifications.
@@ -487,7 +616,14 @@ pub fn is_valid_ipfs_cid(cid: &str) -> bool {
 
 /// Public IPFS gateways an IPFS link downloads from, as mirrors of one another (cloudflare-ipfs.com
 /// closed in 2024).
-const IPFS_GATEWAYS: &[&str] = &["https://ipfs.io", "https://dweb.link", "https://gateway.pinata.cloud", "https://ipfs.filebase.io", "https://4everland.io"];
+const IPFS_GATEWAYS: &[&str] = &[
+    "https://ipfs.io",
+    "https://dweb.link",
+    "https://gateway.pinata.cloud",
+    "https://ipfs.filebase.io",
+    "https://4everland.io",
+    "https://w3s.link",
+];
 
 /// The CID an IPFS link names and the (percent-encoded) path after it: `ipfs://<cid>/<path>`, a
 /// gateway's `/ipfs/<cid>/<path>` on any host, or a subdomain gateway's `<cid>.ipfs.<host>/<path>`.
@@ -664,12 +800,46 @@ impl HostResolver for AnnaArchiveResolver {
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
         let (cookie_header, user_agent) = extract_browser_cookies_for_domain(url.host_str().unwrap_or(""));
 
-        // If it's directly a slow download URL
+        let mut candidates = Vec::new();
+
+        // 1. Extract MD5 from the URL (works for /md5/, /slow_download/, or query parameters)
+        let md5 = Self::extract_md5(url);
+
+        if let Some(ref md5_hash) = md5 {
+            let host = url.host_str().unwrap_or("annas-archive.org");
+
+            // 1a. Fast Download API check (if user configured ANNAS_SECRET_KEY or ANNAS_ARCHIVE_KEY)
+            if let Some(fast_url) = Self::resolve_fast_api(client, host, md5_hash).await {
+                tracing::info!("Anna's Archive: resolved high-speed URL via Fast API");
+                candidates.push(fast_url);
+            }
+
+            // 1b. Fetch book metadata page (/md5/<MD5>) to find IPFS CIDs and external mirrors
+            let book_url_str = format!("{}://{}/md5/{}", url.scheme(), host, md5_hash);
+            if let Ok(book_url) = Url::parse(&book_url_str) {
+                if let Ok(book_candidates) = Self::resolve_book_page(client, &book_url, cookie_header.as_deref(), user_agent.as_deref()).await {
+                    for c in book_candidates {
+                        if !candidates.contains(&c) {
+                            candidates.push(c);
+                        }
+                    }
+                }
+            }
+
+            // If we found fast unthrottled sources (IPFS gateways or resolved LibGen direct links), return them immediately!
+            // This achieves 100x speedup by bypassing slow download countdown queues and 50 KB/s throttled servers.
+            if !candidates.is_empty() {
+                tracing::info!("Anna's Archive: returning {} high-speed sources for MD5 {}", candidates.len(), md5_hash);
+                return Ok(candidates);
+            }
+        }
+
+        // 2. Fallback: Slow download queue (only when no fast IPFS or LibGen mirrors exist)
         if Self::is_slow_download(url) {
             return resolve_slow_download(client, url, cookie_header.as_deref(), user_agent.as_deref()).await;
         }
 
-        // Flow A: Book Page (/md5/<MD5>)
+        // 3. Fallback for book page without MD5 or failed fast resolution: check for slow download link on page
         let mut request = client.get(url.clone());
         if let Some(ref c) = cookie_header {
             if let Ok(hv) = HeaderValue::from_str(c) {
@@ -683,39 +853,130 @@ impl HostResolver for AnnaArchiveResolver {
         }
         request = request.header(reqwest::header::REFERER, "https://annas-archive.gl/");
 
-        let resp = request.send().await?;
-        if !resp.status().is_success() {
-            return Err(ResolverError::NotFound(format!("Anna's Archive returned HTTP {}", resp.status())));
-        }
-
-        let html = read_capped(resp, MAX_HTML_BYTES).await?;
-
-        let mut candidates = Vec::new();
-        if let Some(cid) = Self::extract_ipfs_cid(&html) {
-            tracing::info!("Anna's Archive: extracted IPFS CID {}", cid);
-            candidates.extend(Self::construct_gateway_urls(&cid));
-        }
-        let mirrors = Self::extract_external_mirrors(&html, url);
-        if !mirrors.is_empty() {
-            tracing::info!("Anna's Archive: extracted {} external mirrors", mirrors.len());
-            candidates.extend(mirrors);
-        }
-        if !candidates.is_empty() {
-            return Ok(candidates);
-        }
-
-        // Check if there are slow download links on the page
-        let lower = html.to_ascii_lowercase();
-        for tag in start_tags(&html, &lower, "a") {
-            if let Some(href) = attr_value(tag, "href") {
-                if href.contains("/slow_download/") {
-                    if let Ok(slow_url) = url.join(&href) {
-                        return resolve_slow_download(client, &slow_url, cookie_header.as_deref(), user_agent.as_deref()).await;
+        if let Ok(resp) = request.send().await {
+            if resp.status().is_success() {
+                if let Ok(html) = read_capped(resp, MAX_HTML_BYTES).await {
+                    let lower = html.to_ascii_lowercase();
+                    for tag in start_tags(&html, &lower, "a") {
+                        if let Some(href) = attr_value(tag, "href") {
+                            if href.contains("/slow_download/") {
+                                if let Ok(slow_url) = url.join(&href) {
+                                    return resolve_slow_download(client, &slow_url, cookie_header.as_deref(), user_agent.as_deref()).await;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
+        Ok(vec![url.clone()])
+    }
+}
+
+/// Library Genesis & Mirrors Resolver (library.lol, libgen.is, libgen.li, etc.)
+pub struct LibGenResolver;
+
+impl LibGenResolver {
+    /// Checks whether the given URL is a Library Genesis mirror or landing page.
+    pub fn can_handle(url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let h = host.trim_end_matches('.');
+        h == "library.lol" || h.ends_with(".library.lol")
+            || h == "libgen.is" || h.ends_with(".libgen.is")
+            || h == "libgen.rs" || h.ends_with(".libgen.rs")
+            || h == "libgen.li" || h.ends_with(".libgen.li")
+            || h == "libgen.rocks" || h.ends_with(".libgen.rocks")
+            || h == "libgen.vg" || h.ends_with(".libgen.vg")
+            || h == "libgen.gs" || h.ends_with(".libgen.gs")
+            || h == "libgen.pm" || h.ends_with(".libgen.pm")
+            || h == "libgen.st" || h.ends_with(".libgen.st")
+            || h == "libgen.lc" || h.ends_with(".libgen.lc")
+            || h == "libgen.me" || h.ends_with(".libgen.me")
+    }
+
+    /// Extracts direct download links and IPFS gateway links from LibGen / library.lol HTML.
+    pub fn extract_download_links(html: &str, base_url: &Url) -> Vec<Url> {
+        let mut links = Vec::new();
+        let lower = html.to_ascii_lowercase();
+
+        // 1. Check for any IPFS CIDs mentioned on the page
+        for cid in AnnaArchiveResolver::extract_ipfs_cids(html) {
+            for gw in AnnaArchiveResolver::construct_gateway_urls(&cid) {
+                if !links.contains(&gw) {
+                    links.push(gw);
+                }
+            }
+        }
+
+        // 2. Look for <a> tags with direct downloads
+        for tag in start_tags(html, &lower, "a") {
+            if let Some(href) = attr_value(tag, "href") {
+                let href_trim = href.trim();
+                if href_trim.is_empty() || href_trim == "#" || href_trim.starts_with("javascript:") {
+                    continue;
+                }
+
+                // Check for library.lol direct CDN link (e.g. https://download.library.lol/main/...)
+                if href_trim.contains("download.library.lol") {
+                    if let Ok(u) = base_url.join(href_trim) {
+                        if !links.contains(&u) {
+                            links.insert(0, u); // Direct CDN link at top priority
+                        }
+                    }
+                    continue;
+                }
+
+                // Check for libgen.li get.php (e.g. get.php?md5=...&key=...)
+                if href_trim.contains("get.php?") {
+                    if let Ok(u) = base_url.join(href_trim) {
+                        if !links.contains(&u) {
+                            links.insert(0, u);
+                        }
+                    }
+                    continue;
+                }
+
+                // Check if the link target points to a file download or GET handler
+                if let Ok(u) = base_url.join(href_trim) {
+                    let path_lower = u.path().to_ascii_lowercase();
+                    let is_file_or_get = path_lower.contains("/main/")
+                        || path_lower.contains("/fiction/")
+                        || path_lower.contains("/get.php")
+                        || path_lower.contains("/get/")
+                        || FILE_EXTENSIONS.iter().any(|ext| path_lower.ends_with(&format!(".{ext}")));
+
+                    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+                    if (is_file_or_get || host.contains("ipfs")) && !links.contains(&u) {
+                        links.push(u);
+                    }
+                }
+            }
+        }
+
+        links
+    }
+}
+
+impl HostResolver for LibGenResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        Self::can_handle(url)
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let resp = client
+            .get(url.clone())
+            .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(ResolverError::NotFound(format!("LibGen mirror returned HTTP {}", resp.status())));
+        }
+        let html = read_capped(resp, MAX_HTML_BYTES).await?;
+        let direct = Self::extract_download_links(&html, url);
+        if !direct.is_empty() {
+            return Ok(direct);
+        }
         Ok(vec![url.clone()])
     }
 }
@@ -1409,6 +1670,7 @@ impl SmartResolver {
             || CodeHostResolver.can_handle(url)
             || ArchiveOrgResolver.can_handle(url)
             || AnnaArchiveResolver.can_handle(url)
+            || LibGenResolver.can_handle(url)
             || DoodStreamResolver.can_handle(url)
             || StreamtapeResolver.can_handle(url)
             || crate::mega::handles(url)
@@ -1510,6 +1772,9 @@ impl SmartResolver {
             return tokio::time::timeout(timeout, AnnaArchiveResolver.resolve(client, url))
                 .await
                 .unwrap_or(Err(ResolverError::Timeout(timeout.as_secs())));
+        }
+        if LibGenResolver.can_handle(url) {
+            return with_timeout(LibGenResolver.resolve(client, url)).await;
         }
 
         if let Some(mirrors) = ipfs_mirrors(url) {
@@ -3182,5 +3447,93 @@ host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
         assert!(StreamtapeResolver.can_handle(&Url::parse("https://streamtape.com/v/abc123xyz").unwrap()));
         assert!(StreamtapeResolver.can_handle(&Url::parse("https://streamtape.to/e/abc123xyz").unwrap()));
         assert!(!StreamtapeResolver.can_handle(&Url::parse("https://example.com/v/abc123xyz").unwrap()));
+    }
+
+    #[test]
+    fn test_anna_archive_extract_md5() {
+        let u1 = Url::parse("https://annas-archive.org/md5/8f07ef504d743288f62539da685d2543").unwrap();
+        assert_eq!(AnnaArchiveResolver::extract_md5(&u1), Some("8f07ef504d743288f62539da685d2543".to_string()));
+
+        let u2 = Url::parse("https://annas-archive.gl/slow_download/8f07ef504d743288f62539da685d2543/0/0").unwrap();
+        assert_eq!(AnnaArchiveResolver::extract_md5(&u2), Some("8f07ef504d743288f62539da685d2543".to_string()));
+
+        let u3 = Url::parse("https://annas-archive.li/slow_download/8F07EF504D743288F62539DA685D2543/0/1").unwrap();
+        assert_eq!(AnnaArchiveResolver::extract_md5(&u3), Some("8f07ef504d743288f62539da685d2543".to_string()));
+
+        let u4 = Url::parse("https://annas-archive.org/search?q=rust&md5=8f07ef504d743288f62539da685d2543").unwrap();
+        assert_eq!(AnnaArchiveResolver::extract_md5(&u4), Some("8f07ef504d743288f62539da685d2543".to_string()));
+
+        let u_invalid = Url::parse("https://annas-archive.org/search?q=rust").unwrap();
+        assert_eq!(AnnaArchiveResolver::extract_md5(&u_invalid), None);
+    }
+
+    #[test]
+    fn test_libgen_resolver_can_handle() {
+        let valid = [
+            "https://library.lol/main/8f07ef504d743288f62539da685d2543",
+            "https://library.lol/fiction/8f07ef504d743288f62539da685d2543",
+            "https://libgen.is/get.php?md5=8f07ef504d743288f62539da685d2543",
+            "https://libgen.rs/get.php?md5=8f07ef504d743288f62539da685d2543",
+            "https://libgen.li/ads.php?md5=8f07ef504d743288f62539da685d2543",
+            "https://libgen.rocks/ads.php?md5=8f07ef504d743288f62539da685d2543",
+            "https://libgen.vg/ads.php?md5=8f07ef504d743288f62539da685d2543",
+            "https://libgen.gs/ads.php?md5=8f07ef504d743288f62539da685d2543",
+        ];
+        for u in valid {
+            let parsed = Url::parse(u).unwrap();
+            assert!(LibGenResolver.can_handle(&parsed), "{}", u);
+            assert!(SmartResolver::handles(&parsed), "{}", u);
+        }
+
+        let invalid = [
+            "https://example.com/main/8f07ef504d743288f62539da685d2543",
+            "https://google.com/",
+        ];
+        for u in invalid {
+            let parsed = Url::parse(u).unwrap();
+            assert!(!LibGenResolver.can_handle(&parsed), "{}", u);
+        }
+    }
+
+    #[test]
+    fn test_libgen_extract_download_links() {
+        let base_lol = Url::parse("https://library.lol/main/8f07ef504d743288f62539da685d2543").unwrap();
+        let html_lol = r#"
+            <div id="download">
+                <h2><a href="https://download.library.lol/main/123000/8f07ef504d743288f62539da685d2543/Rust_Book.pdf">GET</a></h2>
+                <ul>
+                    <li><a href="https://ipfs.io/ipfs/bafykic733b5c3j26425a4d654274c5d63f25d62547d6e5c4b3a2a1z9y8x7w6">IPFS.io</a></li>
+                </ul>
+            </div>
+        "#;
+        let links_lol = LibGenResolver::extract_download_links(html_lol, &base_lol);
+        assert!(!links_lol.is_empty());
+        assert_eq!(links_lol[0].as_str(), "https://download.library.lol/main/123000/8f07ef504d743288f62539da685d2543/Rust_Book.pdf");
+        assert!(links_lol.iter().any(|u| u.as_str().contains("ipfs.io")));
+
+        let base_li = Url::parse("https://libgen.li/ads.php?md5=8f07ef504d743288f62539da685d2543").unwrap();
+        let html_li = r#"
+            <table id="main">
+                <tr><td><a href="get.php?md5=8f07ef504d743288f62539da685d2543&key=ABC123XYZ">GET</a></td></tr>
+            </table>
+        "#;
+        let links_li = LibGenResolver::extract_download_links(html_li, &base_li);
+        assert_eq!(links_li.len(), 1);
+        assert_eq!(links_li[0].as_str(), "https://libgen.li/get.php?md5=8f07ef504d743288f62539da685d2543&key=ABC123XYZ");
+    }
+
+    #[test]
+    fn test_anna_archive_extract_ipfs_cids_multiple() {
+        let html = r#"
+            <div class="ipfs-info">
+                <span>CIDv0: ipfs://QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco</span>
+                <span>CIDv1: /ipfs/bafykic733b5c3j26425a4d654274c5d63f25d62547d6e5c4b3a2a1z9y8x7w6</span>
+                <span>Duplicate: ipfs://QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco</span>
+            </div>
+        "#;
+        let cids = AnnaArchiveResolver::extract_ipfs_cids(html);
+        assert_eq!(cids.len(), 2);
+        assert_eq!(cids[0], "QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco");
+        assert_eq!(cids[1], "bafykic733b5c3j26425a4d654274c5d63f25d62547d6e5c4b3a2a1z9y8x7w6");
     }
 }

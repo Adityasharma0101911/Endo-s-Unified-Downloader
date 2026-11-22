@@ -370,7 +370,7 @@ pub fn spinner(ui: &mut Ui, size: f32, color: Color32) -> Response {
         };
         let radius = size / 2.0 - 1.5;
         let points = (0..=24).map(|i| rect.center() + radius * Vec2::angled(start + sweep * i as f32 / 24.0)).collect();
-        ui.painter().add(Shape::line(points, Stroke::new(2.0, color)));
+        ui.painter().add(Shape::line(points, Stroke::new(2.0_f32, color)));
     }
     response
 }

@@ -130,7 +130,7 @@ fn tile(app: &mut App, ui: &mut Ui, kind: &'static Kind) {
     shadow.fill = shadow.fill.gamma_multiply(fade);
     ui.painter().add(shadow);
     let (fill, edge) = (p.card.lerp_to_gamma(p.hover, 0.2 * hover), p.border.lerp_to_gamma(p.dim, 0.5 * hover));
-    ui.painter().rect(lifted, 14.0, fill.gamma_multiply(fade), Stroke::new(1.0, edge.gamma_multiply(fade)));
+    ui.painter().rect(lifted, 14.0, fill.gamma_multiply(fade), Stroke::new(1.0_f32, edge.gamma_multiply(fade)));
     let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(lifted.shrink(14.0)).layout(Layout::top_down(Align::LEFT)));
     ui.multiply_opacity(fade);
     ui.horizontal(|ui| {

@@ -319,7 +319,7 @@ fn library_row(app: &App, ui: &mut Ui, entry: &HistoryEntry, today: i64, offset:
     let hovered = ui.rect_contains_pointer(rect);
     let hover = anim::presence(ui.ctx(), id.with("hover"), hovered, 0.15);
     let painter = ui.painter();
-    painter.rect(rect, 12.0, p.card.lerp_to_gamma(p.hover, 0.3 * hover), Stroke::new(1.0, p.border.gamma_multiply(0.6 + 0.4 * hover)));
+    painter.rect(rect, 12.0, p.card.lerp_to_gamma(p.hover, 0.3 * hover), Stroke::new(1.0_f32, p.border.gamma_multiply(0.6 + 0.4 * hover)));
     let (glyph, color, word) = match &entry.status {
         HistoryStatus::Completed => (icon::CHECK, p.green, None),
         HistoryStatus::Failed(_) => (icon::WARNING_CIRCLE, p.red, Some("Failed")),
@@ -431,7 +431,7 @@ fn verification_card(app: &mut App, ui: &mut Ui) {
         let shown = anim::since(ui.ctx(), egui::Id::new("verification"), (&result.file_path, &message), true);
         let shown = anim::ease(anim::progress(ui.ctx(), shown, 0.0, anim::APPEAR));
         anim::shifted(ui, shown, anim::DROP, |ui| {
-            Frame::none().fill(p.card).stroke(Stroke::new(1.0, color.gamma_multiply(0.7))).inner_margin(14.0).rounding(14.0).show(ui, |ui| {
+            Frame::none().fill(p.card).stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.7))).inner_margin(14.0).rounding(14.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(glyph).size(18.0).color(color));

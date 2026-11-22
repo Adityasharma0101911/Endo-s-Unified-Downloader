@@ -122,7 +122,7 @@ pub(super) fn sidebar(app: &mut App, ctx: &egui::Context) {
         }
         if let Some(n) = pages.iter().position(|page| page.0 == app.tab) {
             let rect = rects[n].translate(Vec2::new(0.0, pill_top(ctx, rects[n].top()) - rects[n].top()));
-            let shape = egui::epaint::RectShape::new(rect, 10.0, p.accent.gamma_multiply(0.2), Stroke::new(1.0, p.link.gamma_multiply(0.25)));
+            let shape = egui::epaint::RectShape::new(rect, 10.0, p.accent.gamma_multiply(0.2), Stroke::new(1.0_f32, p.link.gamma_multiply(0.25)));
             ui.painter().set(pill, shape);
         }
 

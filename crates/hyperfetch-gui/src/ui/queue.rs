@@ -161,7 +161,7 @@ fn detail_header(app: &mut App, ui: &mut Ui, item: &QueueItem, in_place: bool) {
             let drawn = anim::ease(anim::changed(ui.ctx(), egui::Id::new(("completed check", item.id)), done, 0.5));
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
             ui.painter().circle_filled(rect.center(), 9.0 * anim::overshoot(drawn), p.green.gamma_multiply(0.2));
-            anim::paint_check(ui.painter(), rect.shrink(3.0), drawn, Stroke::new(2.0, p.green));
+            anim::paint_check(ui.painter(), rect.shrink(3.0), drawn, Stroke::new(2.0_f32, p.green));
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if !in_place && icon_button(ui, icon::X, "Close the details (Escape)", true).clicked() {
@@ -616,13 +616,13 @@ fn chunk_map(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], total_bytes: u6
         } else {
             painter.rect_filled(seg_rect, 0.0, p.border);
         }
-        painter.line_segment([seg_rect.right_top(), seg_rect.right_bottom()], Stroke::new(1.0, p.card));
+        painter.line_segment([seg_rect.right_top(), seg_rect.right_bottom()], Stroke::new(1.0_f32, p.card));
     }
     for (left, t) in cuts {
-        let light = Stroke::new(2.0, Color32::WHITE.gamma_multiply(1.0 - t));
+        let light = Stroke::new(2.0_f32, Color32::WHITE.gamma_multiply(1.0 - t));
         painter.line_segment([Pos2::new(left, rect.min.y + 1.0), Pos2::new(left, rect.max.y - 1.0)], light);
     }
-    painter.rect_stroke(rect, 8.0, Stroke::new(1.0, p.border));
+    painter.rect_stroke(rect, 8.0, Stroke::new(1.0_f32, p.border));
     ctx.data_mut(|d| d.insert_temp(key, pieces));
 }
 
@@ -798,7 +798,7 @@ fn throughput_graph(ui: &mut Ui, item: usize, history: Option<&VecDeque<(Instant
     let rect = response.rect;
     painter.rect_filled(rect, 10.0, p.field);
     let y_mid = rect.center().y;
-    painter.line_segment([Pos2::new(rect.min.x + 8.0, y_mid), Pos2::new(rect.max.x - 8.0, y_mid)], Stroke::new(1.0, p.border));
+    painter.line_segment([Pos2::new(rect.min.x + 8.0, y_mid), Pos2::new(rect.max.x - 8.0, y_mid)], Stroke::new(1.0_f32, p.border));
 
     let max_y = anim::value(ui.ctx(), id.with("scale"), (peak * 1.15).max(1024.0 * 1024.0) as f32, 0.4) as f64;
     if let Some((_, speed)) = samples.last_mut() {
@@ -830,12 +830,12 @@ fn throughput_graph(ui: &mut Ui, item: usize, history: Option<&VecDeque<(Instant
             mesh.add_triangle(top_left, bot_right, top_right);
         }
         painter.add(egui::Shape::mesh(mesh));
-        painter.add(egui::Shape::line(points.clone(), Stroke::new(2.0, p.link)));
+        painter.add(egui::Shape::line(points.clone(), Stroke::new(2.0_f32, p.link)));
 
         if let Some(&last) = points.last() {
             let pulse = if live { anim::pulse(ui.ctx(), 1.8) } else { 0.0 };
             painter.circle_filled(last, 4.0 + pulse * 3.0, p.link.gamma_multiply(0.15 + pulse * 0.2));
-            painter.circle(last, 3.5, p.field, Stroke::new(2.0, p.link));
+            painter.circle(last, 3.5, p.field, Stroke::new(2.0_f32, p.link));
         }
     }
 
@@ -843,7 +843,7 @@ fn throughput_graph(ui: &mut Ui, item: usize, history: Option<&VecDeque<(Instant
         let target_age = (1.0 - (hover.x - rect.min.x) / rect.width()) * window;
         let nearest = samples.iter().min_by(|(a, _), (b, _)| (a - target_age).abs().total_cmp(&(b - target_age).abs()));
         if let Some((_, speed)) = nearest {
-            painter.line_segment([Pos2::new(hover.x, rect.min.y), Pos2::new(hover.x, rect.max.y)], Stroke::new(1.0, p.muted));
+            painter.line_segment([Pos2::new(hover.x, rect.min.y), Pos2::new(hover.x, rect.max.y)], Stroke::new(1.0_f32, p.muted));
             response.show_tooltip_text(format!("{}s ago: {}/s", target_age as u64, format_bytes(*speed as u64)));
         }
     }
@@ -1246,8 +1246,8 @@ fn status_icon(ui: &mut Ui, item: &QueueItem, waiting: bool, stalled: bool, colo
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::hover());
     let glyph = match item.status {
         QueueItemStatus::Completed => {
-            ui.painter().circle_stroke(rect.center(), SIZE / 2.0 - 1.0, Stroke::new(1.5, color));
-            anim::paint_check(ui.painter(), rect.shrink(4.0), anim::ease(t), Stroke::new(2.0, color));
+            ui.painter().circle_stroke(rect.center(), SIZE / 2.0 - 1.0, Stroke::new(1.5_f32, color));
+            anim::paint_check(ui.painter(), rect.shrink(4.0), anim::ease(t), Stroke::new(2.0_f32, color));
             return;
         }
         QueueItemStatus::Downloading => icon::ARROW_DOWN,
@@ -1370,7 +1370,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
             Some(color) => fill.lerp_to_gamma(color, 0.22 * (1.0 - anim::ease(t))),
             None => fill,
         };
-        painter.rect(lifted, 14.0, fade(fill), Stroke::new(1.0, fade(p.border.lerp_to_gamma(p.dim, 0.5 * hover))));
+        painter.rect(lifted, 14.0, fade(fill), Stroke::new(1.0_f32, fade(p.border.lerp_to_gamma(p.dim, 0.5 * hover))));
     }
     let inner = egui::UiBuilder::new().max_rect(lifted.shrink2(Vec2::new(16.0, 9.0))).layout(Layout::top_down(Align::LEFT));
     let mut ui = ui.new_child(inner);
@@ -1742,7 +1742,7 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
             ui.data_mut(|d| d.insert_temp(key.with("at"), (y, from)));
             let at = y - range.start as f32;
             let rect = Rect::from_min_size(first + Vec2::new(0.0, at * stride), Vec2::new(ui.available_width(), ROW_HEIGHT));
-            ui.painter().rect(rect, 14.0, p.accent.gamma_multiply(0.07), Stroke::new(1.5, p.link.gamma_multiply(0.85)));
+            ui.painter().rect(rect, 14.0, p.accent.gamma_multiply(0.07), Stroke::new(1.5_f32, p.link.gamma_multiply(0.85)));
         }
         // A card being dragged lands in the gap nearest the pointer, which a line shows;
         // dropped there, it moves.
@@ -1753,7 +1753,7 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
             if to != from {
                 let y = top + gap as f32 * stride - ui.spacing().item_spacing.y / 2.0;
                 let (left, right) = (ui.max_rect().left() + 4.0, ui.max_rect().right() - 4.0);
-                ui.painter().line_segment([Pos2::new(left, y), Pos2::new(right, y)], Stroke::new(2.0, p.accent));
+                ui.painter().line_segment([Pos2::new(left, y), Pos2::new(right, y)], Stroke::new(2.0_f32, p.accent));
                 ui.painter().circle_filled(Pos2::new(left, y), 4.0, p.accent);
                 if dropped {
                     action = Some((id, RowAction::MoveTo(to)));

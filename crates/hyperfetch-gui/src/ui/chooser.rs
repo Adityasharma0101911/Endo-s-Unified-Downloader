@@ -16,7 +16,7 @@ pub(super) fn chooser(app: &mut App, ui: &mut Ui) {
     ui.add_space(6.0);
     // Some(true): use the picks; Some(false): close.
     let mut choice = None;
-    Frame::none().stroke(Stroke::new(1.0, p.border)).rounding(8.0).inner_margin(12.0).show(ui, |ui| {
+    Frame::none().stroke(Stroke::new(1.0_f32, p.border)).rounding(8.0).inner_margin(12.0).show(ui, |ui| {
         ui.set_width(ui.available_width());
         match &chooser.info {
             None => {

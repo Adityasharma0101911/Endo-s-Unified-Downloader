@@ -211,7 +211,7 @@ pub(super) fn palette(app: &mut App, ctx: &egui::Context) {
     let mut ran = None;
     egui::Area::new(finder_id().with("box")).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
         ui.multiply_opacity(shown);
-        let frame = Frame::none().fill(p.card).stroke(Stroke::new(1.0, p.border)).rounding(16.0).inner_margin(10.0).shadow(card_shadow(ui, 1.0));
+        let frame = Frame::none().fill(p.card).stroke(Stroke::new(1.0_f32, p.border)).rounding(16.0).inner_margin(10.0).shadow(card_shadow(ui, 1.0));
         frame.show(ui, |ui| {
             ui.set_width(width - 20.0);
             ui.horizontal(|ui| {
