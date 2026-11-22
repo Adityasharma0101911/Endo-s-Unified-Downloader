@@ -313,6 +313,10 @@ impl AnnaArchiveResolver {
             || h.ends_with(".annas-archive.org")
             || h == "annas-archive.gl"
             || h.ends_with(".annas-archive.gl")
+            || h == "annas-archive.pk"
+            || h.ends_with(".annas-archive.pk")
+            || h == "annas-archive.gd"
+            || h.ends_with(".annas-archive.gd")
             || h == "annas-archive.li"
             || h.ends_with(".annas-archive.li")
             || h == "annas-archive.se"
@@ -323,6 +327,9 @@ impl AnnaArchiveResolver {
             || h.ends_with(".annas-archive.gs")
             || h == "annas-archive.to"
             || h.ends_with(".annas-archive.to")
+            || h.starts_with("annas-archive.")
+            || url.path().contains("annas_archive_data")
+            || url.path().contains("annas-arch-")
     }
 
     /// Whether this is a book overview/metadata page (/md5/<MD5>).
@@ -356,6 +363,12 @@ impl AnnaArchiveResolver {
                 let seg_lower = seg.to_ascii_lowercase();
                 if Self::is_valid_md5(&seg_lower) {
                     return Some(seg_lower);
+                }
+                if let Some(stripped) = seg_lower.strip_prefix("annas-arch-") {
+                    let candidate: String = stripped.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                    if Self::is_valid_md5(&candidate) {
+                        return Some(candidate);
+                    }
                 }
             }
         }
@@ -3914,6 +3927,9 @@ host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
             "https://annas-archive.pm/slow_download/test",
             "https://annas-archive.gs/md5/test",
             "https://annas-archive.to/md5/test",
+            "https://annas-archive.pk/md5/test",
+            "https://annas-archive.gd/md5/test",
+            "https://wbsg8v.xyz/d4/y/anon/s/1795389299/1000/g3/zlib3_files/annas-arch-8f07ef504d74.pdf",
         ];
         for u in valid {
             let parsed = Url::parse(u).unwrap();
