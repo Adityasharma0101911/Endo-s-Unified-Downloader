@@ -7,7 +7,7 @@ body:
     attributes:
       label: Version
       description: The app's version (Settings > Updates, or `Endos-Unified-Downloader-CLI --version`).
-      placeholder: "2.2.6"
+      placeholder: "2.2.7"
     validations:
       required: true
   - type: dropdown
