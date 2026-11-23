@@ -79,6 +79,7 @@ pub mod steam;
 pub mod livestream;
 pub mod warc;
 pub mod savepage;
+pub mod webcopy;
 pub mod casync;
 #[cfg(test)]
 pub(crate) mod netsim;

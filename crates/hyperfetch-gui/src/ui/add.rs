@@ -404,6 +404,7 @@ pub(super) fn front_door(app: &mut App, ui: &mut Ui) {
         ui.add_space(8.0);
         preview_card(app, ui, kind, &source);
     });
+    copying_row(app, ui);
     ui.add_space(14.0);
 }
 
@@ -512,10 +513,11 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
                 let label = if saving { format!("{} Saving the page…", icon::HOURGLASS) } else { format!("{} Save this page as one file", icon::FILE_HTML) };
                 let tip = "Its images, styles and frames put into one HTML file that opens offline; its scripts left out unless More options keeps them";
                 if ui.add_enabled(link.is_some() && !saving, button(label)).on_hover_text(tip).clicked() {
-                    if let Some(link) = link {
+                    if let Some(link) = link.clone() {
                         app.save_page(link);
                     }
                 }
+                working_copy(app, ui, link);
             }
             ui.label(RichText::new(icon::FOLDER_OPEN).size(16.0).color(p.muted)).on_hover_text("Save to");
             let folder = std::path::Path::new(&app.settings.save_dir);
@@ -561,6 +563,61 @@ fn card_kind(app: &App) -> Option<(&'static kinds::Kind, String)> {
         peek::Peek::Page(_) => kinds::named("A web page"),
     });
     Some((told.unwrap_or(kind), source))
+}
+
+/// Under the link bar while a working copy is recorded (see `App::save_copy`), whatever the bar
+/// holds by then: how far it is, and Stop copying.
+fn copying_row(app: &mut App, ui: &mut Ui) {
+    let Some(copying) = &app.copying else { return };
+    let p = palette(ui);
+    let said = match copying.site {
+        true => format!("{} Copying the site: {} pages, {}", icon::HOURGLASS, copying.pages, util::format_bytes(copying.bytes)),
+        false => format!("{} Copying the page…", icon::HOURGLASS),
+    };
+    let link = copying.link.clone();
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.label(RichText::new(said).color(p.muted)).on_hover_text(link);
+        let tip = "A site keeps the pages it has and goes on from them when copied again; a page stopped half way leaves nothing";
+        if ui.add(button(format!("{} Stop copying", icon::STOP))).on_hover_text(tip).clicked() {
+            app.stop_copy();
+        }
+    });
+}
+
+/// On a web page's card: Save a working copy, of this page or of the whole site (see
+/// `App::save_copy`), while none is recorded; and Open the copy, once this page has one.
+fn working_copy(app: &mut App, ui: &mut Ui, link: Option<Url>) {
+    if app.copying.is_none() {
+        let menu = ui.make_persistent_id("working copy");
+        let tip = "Recorded with the browser on this computer (Edge or Chrome): the page with its scripts, styles, fonts and the data it asks for, in one file that plays back in a browser window as the page was";
+        let open = ui.add_enabled(link.is_some(), button(format!("{} Save a working copy", icon::BROWSERS))).on_hover_text(tip);
+        if open.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(menu));
+        }
+        let mut site = None;
+        egui::popup_below_widget(ui, menu, &open, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            ui.set_min_width(240.0);
+            if ui.selectable_label(false, "This page").clicked() {
+                site = Some(false);
+            }
+            let tip = "Also the pages its links lead to, in its folder on its site, as its robots.txt allows: up to 100 pages each time";
+            if ui.selectable_label(false, "The whole site").on_hover_text(tip).clicked() {
+                site = Some(true);
+            }
+        });
+        if let (Some(site), Some(link)) = (site, link.clone()) {
+            app.save_copy(link, site);
+        }
+    }
+    let copy = app.copied.as_ref().filter(|(of, _)| link.as_ref().is_some_and(|link| link.as_str() == of)).map(|(_, file)| file.clone());
+    if let Some(file) = copy {
+        let tip = "In a browser window of its own that has no network: every request is answered from the copy";
+        if ui.add(button(format!("{} Open the copy", icon::PLAY))).on_hover_text(tip).clicked() {
+            app.open_copy(file);
+        }
+    }
 }
 
 /// For a link in the box whose text does not say what it is, `unsure` (see `kinds::unsure`):
@@ -2129,5 +2186,67 @@ mod tests {
         assert_eq!(h.app.url_input, "https://www.youtube.com/watch?v=aqz-KE-bpKQ");
         h.frames(3);
         assert!(h.find("A video").is_some(), "{:?}", h.texts());
+    }
+
+    /// A web page's card offers a working copy, of the page or of the whole site. The page's is
+    /// recorded off the UI thread: the notice says what it holds, the Library keeps its file, and
+    /// the card then offers to open it, which plays that file. One that cannot be recorded says why.
+    #[test]
+    fn a_page_is_saved_as_a_working_copy_and_opened() {
+        let mut h = Harness::new();
+        h.app.url_input = "https://site.example/peek-bare".to_string();
+        asked(&mut h);
+        assert!(h.find("Save a working copy").is_some() && h.find("Open the copy").is_none(), "{:?}", h.texts());
+        h.click("Save a working copy");
+        h.frames(3);
+        h.click("This page");
+        assert!(h.app.copying.as_ref().is_some_and(|copying| !copying.site));
+        h.wait_for(|app| app.copying.is_none());
+        assert!(matches!(&h.app.notice, Some(Ok(notice)) if notice == "Saved a working copy: example.com page.warc.gz (1 page, 3.00 MiB)"), "{:?}", h.app.notice);
+        let file = std::path::Path::new(&h.app.settings.save_dir).join("example.com page.warc.gz");
+        h.wait_for(|app| app.history.iter().any(|entry| entry.file_path == file));
+        h.frames(3);
+        h.click("Open the copy");
+        h.wait_for(|app| matches!(&app.notice, Some(Err(notice)) if notice.contains("example.com page.warc.gz")));
+
+        h.app.url_input = "https://site.example/peek-bare?copy-fails".to_string();
+        asked(&mut h);
+        assert!(h.find("Open the copy").is_none(), "another page's copy is not this one's: {:?}", h.texts());
+        h.click("Save a working copy");
+        h.frames(3);
+        h.click("This page");
+        h.wait_for(|app| app.copying.is_none());
+        assert!(matches!(&h.app.notice, Some(Err(notice)) if notice.starts_with("Could not save a working copy: No Edge or Chrome")), "{:?}", h.app.notice);
+        h.wait_for_background();
+    }
+
+    /// The whole site says how far it is while it is copied, under the link bar whatever that
+    /// holds, and the card offers no second copy meanwhile; Stop keeps the pages it has, in the
+    /// Library too, and the card offers to open them.
+    #[test]
+    fn a_site_being_copied_says_how_far_it_is_and_stops() {
+        let mut h = Harness::new();
+        h.app.url_input = "https://site.example/peek-bare".to_string();
+        asked(&mut h);
+        h.click("Save a working copy");
+        h.frames(3);
+        h.click("The whole site");
+        assert!(h.app.copying.as_ref().is_some_and(|copying| copying.site));
+        h.wait_for(|app| app.copying.as_ref().is_some_and(|copying| copying.pages == 2));
+        h.frames(3);
+        assert!(h.find("Copying the site: 2 pages, 3.00 MiB").is_some() && h.find("Save a working copy").is_none(), "{:?}", h.texts());
+        // It stays under the link bar whatever the bar holds by then.
+        h.app.url_input.clear();
+        h.frames(30);
+        assert!(h.find("Copying the site: 2 pages, 3.00 MiB").is_some(), "{:?}", h.texts());
+        h.click("Stop copying");
+        assert!(h.app.copying.is_none());
+        assert!(matches!(&h.app.notice, Some(Ok(notice)) if notice.starts_with("Stopped: the copy keeps its 2 pages")), "{:?}", h.app.notice);
+        let file = std::path::Path::new(&h.app.settings.save_dir).join("example.com page.warc.gz");
+        h.wait_for(|app| app.history.iter().any(|entry| entry.file_path == file));
+        h.app.url_input = "https://site.example/peek-bare".to_string();
+        asked(&mut h);
+        assert!(h.find("Save a working copy").is_some() && h.find("Open the copy").is_some(), "{:?}", h.texts());
+        h.wait_for_background();
     }
 }

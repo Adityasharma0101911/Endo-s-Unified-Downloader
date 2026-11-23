@@ -271,6 +271,8 @@ enum Act {
     Reveal(std::path::PathBuf),
     Copy(String),
     Subtitles(std::path::PathBuf),
+    /// Play a working copy (see `App::open_copy`).
+    Play(std::path::PathBuf),
 }
 
 fn act(app: &mut App, what: Act) {
@@ -291,6 +293,7 @@ fn act(app: &mut App, what: Act) {
         Act::Reveal(path) => report(app, util::reveal_in_folder(&path)),
         Act::Copy(link) => app.copy_text(link),
         Act::Subtitles(video) => app.find_subtitles(video),
+        Act::Play(copy) => app.open_copy(copy),
     }
 }
 
@@ -383,6 +386,9 @@ fn library_row(app: &App, ui: &mut Ui, entry: &HistoryEntry, today: i64, offset:
         }
         if icon_button(ui, icon::FOLDER_OPEN, "Show in its folder", true).clicked() {
             *action = Some(Act::Reveal(entry.file_path.clone()));
+        }
+        if hyperfetch_core::webcopy::is_copy(&entry.file_path) && icon_button(ui, icon::PLAY, "Open the copy in a browser window", true).clicked() {
+            *action = Some(Act::Play(entry.file_path.clone()));
         }
         if video && icon_button(ui, icon::SUBTITLES, "Find subtitles on OpenSubtitles", true).clicked() {
             *action = Some(Act::Subtitles(entry.file_path.clone()));
@@ -545,5 +551,23 @@ mod tests {
         assert!(h.settle());
         assert!(h.find("file-00000.iso").is_none(), "scrolled away");
         assert!(h.texts().iter().any(|(text, _)| text == "Today" || text == "Yesterday"), "the heading stays: {:?}", h.texts());
+    }
+
+    /// A working copy's row has a button that plays it; another file's row has none.
+    #[test]
+    fn a_working_copy_is_played_from_its_row() {
+        let mut h = Harness::new();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        h.app.history = vec![entry(0, now)];
+        h.app.tab = Tab::Library;
+        assert!(h.settle());
+        assert!(h.find(icon::PLAY).is_none(), "{:?}", h.texts());
+        let mut copy = entry(1, now);
+        (copy.file_name, copy.file_path) = ("example.com docs.warc.gz".to_string(), std::env::temp_dir().join("example.com docs.warc.gz"));
+        h.app.history.push(copy);
+        h.frames(5);
+        h.click_at(h.find(icon::PLAY).expect("a working copy has Play").center());
+        h.wait_for(|app| matches!(&app.notice, Some(Err(notice)) if notice.contains("example.com docs.warc.gz")));
+        h.wait_for_background();
     }
 }

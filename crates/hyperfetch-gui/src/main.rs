@@ -31,6 +31,7 @@ use hyperfetch_core::ingest::{self, Channel, Task};
 use hyperfetch_core::media;
 use hyperfetch_core::paste;
 use hyperfetch_core::peek;
+use hyperfetch_core::webcopy;
 use hyperfetch_core::quality::{MediaPick, Qualities};
 use hyperfetch_core::queue::{DownloadQueue, QueueItem, QueueItemStatus};
 use hyperfetch_core::relink;
@@ -206,6 +207,13 @@ enum AppEvent {
     /// The page at `link` saved as one file (see [`App::save_page`]), begun at Unix second
     /// `started`: the file, its size, how many things were put in and how many left as links.
     PageSaved { link: String, started: u64, result: Result<(PathBuf, u64, usize, usize), String> },
+    /// How far the working copy being recorded is (see [`App::save_copy`]): its file, the pages
+    /// in it and the bytes this run kept.
+    CopyProgress { file: PathBuf, pages: usize, bytes: u64 },
+    /// The working copy of `link` recorded, begun at Unix second `started`.
+    Copied { link: String, started: u64, result: Result<webcopy::Copied, String> },
+    /// A working copy's window closed (see [`App::open_copy`]), or why it never opened.
+    CopyPlayed(Result<(), String>),
     /// Whether new download `id` has the file of another download, as its server's size and
     /// samples of its bytes tell (see [`App::look_for_twin`]).
     TwinChecked { id: usize, same: bool },
@@ -245,6 +253,20 @@ impl MediaCard {
 /// The link the Add page's card asked its server about (see [`App::peek_link`]): what it said
 /// (None meanwhile), what a download takes of its page, and the files the page links to, each
 /// with whether it is ticked, listed once `open`.
+/// A working copy being recorded (see [`App::save_copy`]).
+struct Copying {
+    link: String,
+    /// The whole site, not the page alone.
+    site: bool,
+    /// Begun at this Unix second.
+    started: u64,
+    /// Its file once it has a page, the pages in it and the bytes this run kept.
+    file: Option<PathBuf>,
+    pages: usize,
+    bytes: u64,
+    task: JoinHandle<()>,
+}
+
 struct PeekCard {
     link: String,
     found: Option<Result<peek::Peeked, String>>,
@@ -580,6 +602,10 @@ struct App {
     keep_scripts: bool,
     /// The link of the page being saved as one file (see [`App::save_page`]).
     saving_page: Option<String>,
+    /// The working copy being recorded (see [`App::save_copy`]).
+    copying: Option<Copying>,
+    /// The working copy last recorded: its page's link and its file, for the card's Open the copy.
+    copied: Option<(String, PathBuf)>,
     /// The track chooser open (see [`App::list_tracks`]).
     tracks: Option<tracks::Chooser>,
     /// Channel lists waiting for the channels to record to be ticked, first come first.
@@ -758,6 +784,8 @@ impl App {
             songs_card: None,
             keep_scripts: false,
             saving_page: None,
+            copying: None,
+            copied: None,
             tracks: None,
             channel_lists: Vec::new(),
             phone,
@@ -1050,6 +1078,92 @@ impl App {
         entry.started_at = started;
         entry.completed_at = Some(SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
         self.update_history(move |history| history.add_or_update(entry));
+    }
+
+    /// Records the web page at `url`, or with `site` the site that starts there, as a working
+    /// copy in the save folder (see `webcopy`: loaded in the browser on this computer, every
+    /// answer it gets kept in one file that plays back as the page was), off the UI thread and
+    /// through the proxy setting. The card says how far it is; the notice says how it went and
+    /// the Library keeps the file. One copy at a time.
+    fn save_copy(&mut self, url: Url, site: bool) {
+        if self.copying.is_some() {
+            return;
+        }
+        let link = url.to_string();
+        let options = self.settings.download_options(std::slice::from_ref(&url), "", "");
+        let dir = PathBuf::from(&self.settings.save_dir);
+        let started = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
+        let tell = move |done: &webcopy::Copied| {
+            if tx.send(AppEvent::CopyProgress { file: done.file.clone(), pages: done.pages, bytes: done.bytes }).is_ok() {
+                ctx.request_repaint();
+            }
+        };
+        let of = link.clone();
+        let task = self.spawn_event(async move {
+            let result = match options {
+                Ok(options) => copy_page(url, dir, site, options, tell).await,
+                Err(e) => Err(e),
+            };
+            AppEvent::Copied { link: of, started, result }
+        });
+        self.copying = Some(Copying { link, site, started, file: None, pages: 0, bytes: 0, task });
+    }
+
+    /// Stops the working copy being recorded. A site keeps the pages it has, in the Library too,
+    /// and goes on from them when copied again; a page stopped half way leaves nothing.
+    fn stop_copy(&mut self) {
+        let Some(copying) = self.copying.take() else { return };
+        copying.task.abort();
+        match copying.file.filter(|_| copying.site && copying.pages > 0) {
+            Some(file) => {
+                self.notice = Some(Ok(format!("Stopped: the copy keeps its {} pages, and copying the whole site again goes on from them", copying.pages)));
+                self.keep_copy(copying.link, file, copying.started);
+            }
+            None => self.notice = Some(Ok("Stopped copying the page".to_string())),
+        }
+    }
+
+    /// A working copy recorded (see [`App::save_copy`]): the notice says which file and what it
+    /// holds, and the Library gets it; or the notice says why there is none.
+    fn copy_saved(&mut self, link: String, started: u64, result: Result<webcopy::Copied, String>) {
+        self.copying = None;
+        let done = match result {
+            Ok(done) => done,
+            Err(e) => return self.notice = Some(Err(format!("Could not save a working copy: {}", e))),
+        };
+        let name = done.file.file_name().map_or_else(|| done.file.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let pages = if done.pages == 1 { "1 page".to_string() } else { format!("{} pages", done.pages) };
+        let mut said = format!("Saved a working copy: {} ({}, {})", name, pages, util::format_bytes(done.bytes));
+        if !done.failed.is_empty() {
+            said.push_str(&format!("; {} could not be loaded", done.failed.len()));
+        }
+        if done.disallowed > 0 {
+            said.push_str(&format!("; {} left out as robots.txt asks", done.disallowed));
+        }
+        if let Some(why) = &done.stopped {
+            said.push_str(&format!(". It stopped early ({}): copy the whole site again to go on", why));
+        }
+        self.notice = Some(Ok(said));
+        self.keep_copy(link, done.file, started);
+    }
+
+    /// Puts the working copy `file` of `link` in the Library and on its link's card.
+    fn keep_copy(&mut self, link: String, file: PathBuf, started: u64) {
+        let name = file.file_name().map_or_else(|| file.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let bytes = std::fs::metadata(&file).map_or(0, |m| m.len());
+        let mut entry = HistoryEntry::new(name, file.clone(), bytes, vec![link.clone()]);
+        entry.downloaded_bytes = bytes;
+        entry.started_at = started;
+        entry.completed_at = Some(SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+        self.update_history(move |history| history.add_or_update(entry));
+        self.copied = Some((link, file));
+    }
+
+    /// Plays the working copy `file` in a browser window of its own that has no network (see
+    /// `webcopy::play`); the notice says why when it cannot.
+    fn open_copy(&mut self, file: PathBuf) {
+        self.spawn_event(async move { AppEvent::CopyPlayed(play_copy(file).await) });
     }
 
     /// Queues a download of each file ticked in the ZIP the Add page lists (see
@@ -2471,6 +2585,17 @@ impl App {
             AppEvent::Relinked { id, urls, options, result } => self.relinked(id, urls, options, result),
             AppEvent::TwinChecked { id, same } => self.twin_checked(id, same),
             AppEvent::PageSaved { link, started, result } => self.page_saved(link, started, result),
+            AppEvent::CopyProgress { file, pages, bytes } => {
+                if let Some(copying) = &mut self.copying {
+                    (copying.file, copying.pages, copying.bytes) = (Some(file), pages, bytes);
+                }
+            }
+            AppEvent::Copied { link, started, result } => self.copy_saved(link, started, result),
+            AppEvent::CopyPlayed(played) => {
+                if let Err(e) = played {
+                    self.notice = Some(Err(format!("Could not open the copy: {e}")));
+                }
+            }
         }
     }
 
@@ -3318,6 +3443,43 @@ async fn media_listing(url: &Url, _cookies: media::BrowserCookieSource, _proxy: 
     let info = media::media_info(&serde_json::from_str(found).map_err(|e| e.to_string())?);
     let music = hyperfetch_core::music::kind(url).map(|_| "A song by Sample Artist".to_string());
     Ok(media::MediaInfo { music, ..info })
+}
+
+/// Records `url`, or with `site` the site that starts there, as a working copy in `dir` (see
+/// `webcopy::record`), through the proxy of `options`.
+#[cfg(not(test))]
+async fn copy_page(url: Url, dir: PathBuf, site: bool, options: DownloadOptions, tell: impl FnMut(&webcopy::Copied) + Send) -> Result<webcopy::Copied, String> {
+    let copy = webcopy::CopyOptions { whole_site: site, proxy: options.proxy.clone(), ..Default::default() };
+    let client = unblock(move || build_client(&options)).await??;
+    webcopy::record(&client, &url, &dir, &copy, tell).await
+}
+
+/// A stand-in for `webcopy::record` that starts no browser: a page is copied at once (one whose
+/// link says `copy-fails` is not); a site tells of two pages, then goes on until it is stopped.
+#[cfg(test)]
+async fn copy_page(url: Url, dir: PathBuf, site: bool, _options: DownloadOptions, mut tell: impl FnMut(&webcopy::Copied) + Send) -> Result<webcopy::Copied, String> {
+    if url.as_str().contains("copy-fails") {
+        return Err("No Edge or Chrome was found on this computer".to_string());
+    }
+    let mut done = webcopy::Copied { file: dir.join("example.com page.warc.gz"), title: "Sample page".to_string(), pages: 1, answers: 12, bytes: 3 << 20, ..Default::default() };
+    if site {
+        done.pages = 2;
+        tell(&done);
+        std::future::pending::<()>().await;
+    }
+    Ok(done)
+}
+
+/// Plays the working copy `file` until its window is closed (see `webcopy::play`).
+#[cfg(not(test))]
+async fn play_copy(file: PathBuf) -> Result<(), String> {
+    webcopy::play(&file).await
+}
+
+/// A stand-in for `webcopy::play` that opens no window, and says which copy it was asked for.
+#[cfg(test)]
+async fn play_copy(file: PathBuf) -> Result<(), String> {
+    Err(format!("no browser plays {} in a test", file.display()))
 }
 
 /// What the server of `url` says it is (see `peek::peek`), asked as a download with `options`

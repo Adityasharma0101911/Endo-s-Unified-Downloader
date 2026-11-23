@@ -47,6 +47,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = { version = "0.26", default-features = false }
 webpki-roots = "1"
 crc32fast = "1"
+# The browser's DevTools port, a WebSocket on this computer (webcopy.rs): no TLS, no extras.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Time", "Win32_Security"] }

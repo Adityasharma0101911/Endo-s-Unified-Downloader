@@ -598,6 +598,36 @@ pub struct Args {
     #[arg(long = "keep-scripts", requires = "save_page")]
     pub keep_scripts: bool,
 
+    /// Record the web page at URL with the browser on this computer (Edge or Chrome, in no
+    /// window) into one file that plays back as the page was: its scripts, style sheets, fonts
+    /// and animations run, on the data they asked for. The page is scrolled to its end and its
+    /// pictures and media asked for first. Play it with --open-copy
+    #[arg(long = "working-copy", value_name = "URL", conflicts_with_all = ["mirror", "save_page", "wayback", "warc", "input_file", "urls", "dry_run", "spider", "preview", "stdout", "list_tracks"])]
+    pub working_copy: Option<String>,
+
+    /// With --working-copy: also the pages its links lead to, in its folder on its host, as its
+    /// robots.txt allows, one page at a time; run it again to go on where it stopped
+    #[arg(long = "whole-site", requires = "working_copy")]
+    pub whole_site: bool,
+
+    /// How many links away from the first page --whole-site follows
+    #[arg(long = "copy-depth", value_name = "N", default_value_t = 5, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=20), requires = "whole_site")]
+    pub copy_depth: usize,
+
+    /// Most pages one --whole-site run copies
+    #[arg(long = "copy-max-pages", value_name = "N", default_value_t = 100, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=100_000), requires = "whole_site")]
+    pub copy_max_pages: usize,
+
+    /// Most bytes one --working-copy run keeps, e.g. 200M or 2G (powers of 1024)
+    #[arg(long = "copy-max-size", value_name = "SIZE", default_value = "1G", value_parser = parse_bytes, requires = "working_copy")]
+    pub copy_max_size: u64,
+
+    /// Play the working copy in FILE (the .warc.gz --working-copy wrote) in a browser window
+    /// that has no network: every request its pages make is answered from the file. Ends when
+    /// the window is closed
+    #[arg(long = "open-copy", value_name = "FILE", conflicts_with_all = ["working_copy", "mirror", "save_page", "wayback", "warc", "input_file", "urls", "dry_run", "spider", "preview", "stdout", "list_tracks"])]
+    pub open_copy: Option<PathBuf>,
+
     /// Also write what --mirror, --save-page or --wayback downloads into the WARC file FILE
     /// (.warc.gz, each answer as received; added to when it exists), with a CDXJ index beside it
     #[arg(long = "warc", value_name = "FILE")]

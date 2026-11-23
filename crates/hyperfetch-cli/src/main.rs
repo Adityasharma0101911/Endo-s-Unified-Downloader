@@ -24,7 +24,7 @@ use hyperfetch_core::ingest::{
 use hyperfetch_core::TrackChoice;
 use hyperfetch_core::media::{self, find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::p2p;
-use hyperfetch_core::{savepage, sitemirror, wayback};
+use hyperfetch_core::{savepage, sitemirror, wayback, webcopy};
 use hyperfetch_core::paste::{self, PastedLink};
 use hyperfetch_core::postprocess::PostOptions;
 use hyperfetch_core::resolver::SmartResolver;
@@ -200,6 +200,12 @@ async fn app(mut args: Args) -> i32 {
     }
     if let Some(page) = &args.save_page {
         return save_page(&args, page, &ui, &shutdown, &http).await;
+    }
+    if let Some(page) = &args.working_copy {
+        return working_copy(&args, page, &ui, &shutdown, &http).await;
+    }
+    if let Some(file) = &args.open_copy {
+        return open_copy(file, &ui, &shutdown).await;
     }
     let code = if args.urls.is_empty() && args.input_file.is_none() {
         interactive(&args, &ui, &shutdown, &http, at_terminal().then_some(find_ffmpeg_path as Finder), prompt).await
@@ -1063,6 +1069,82 @@ async fn mirror_site(args: &Args, site: &str, ui: &Ui, shutdown: &Shutdown, http
         Err(e) => {
             ui.error(&format!("[FAILED] {}: {}", redact_url(site), e));
             shutdown.requested().unwrap_or(EXIT_FAILED)
+        }
+    }
+}
+
+/// --working-copy: records the web page at `page`, or with --whole-site the site that starts
+/// there, with the browser on this computer into one file in the download directory (see
+/// `webcopy`). Ctrl+C stops it; a site goes on from there when run again.
+async fn working_copy(args: &Args, page: &str, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
+    let url = match Url::parse(page.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        _ => return usage(&format!("--working-copy takes a web page's http(s) link, not '{}'", redact_url(page))),
+    };
+    let dir = match prepare_dir(args.dir.as_deref().unwrap_or(Path::new("."))).await {
+        Ok(dir) => dir,
+        Err(e) => return usage(&e),
+    };
+    let options = webcopy::CopyOptions {
+        whole_site: args.whole_site,
+        depth: args.copy_depth,
+        max_pages: args.copy_max_pages,
+        max_bytes: args.copy_max_size,
+        proxy: args.proxy.clone(),
+        ..webcopy::CopyOptions::default()
+    };
+    let quiet = ui.quiet();
+    let tell = |done: &webcopy::Copied| {
+        if !quiet && args.whole_site {
+            ui.error(&format!("{} page(s), {}", done.pages, HumanBytes(done.bytes)));
+        }
+    };
+    let mut stop = shutdown.subscribe();
+    let copied = tokio::select! {
+        copied = webcopy::record(http, &url, &dir, &options, tell) => copied,
+        () = stop_requested(&mut stop) => Err(if args.whole_site { "stopped; run it again to go on where it stopped" } else { "stopped" }.to_string()),
+    };
+    match copied {
+        Ok(done) => {
+            for (url, why) in &done.failed {
+                ui.error(&format!("[FAILED] {}: {}", truncate(url, 80), why));
+            }
+            if !quiet {
+                let mut line = format!("[OK] {}: {} page(s), {} answer(s) kept, {}", done.file.display(), done.pages, done.answers, HumanBytes(done.bytes));
+                if done.left > 0 {
+                    line.push_str(&format!("; {} left out (too large, or gone before they were read)", done.left));
+                }
+                if done.disallowed > 0 {
+                    line.push_str(&format!("; {} page(s) left out as robots.txt asks", done.disallowed));
+                }
+                ui.error(&line);
+                if let Some(why) = &done.stopped {
+                    ui.error(&format!("Stopped early: {why}. Run it again to go on"));
+                }
+                ui.error(&format!("Play it with --open-copy \"{}\"", done.file.display()));
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            ui.error(&format!("[FAILED] {}: {}", redact_url(page), e));
+            shutdown.requested().unwrap_or(EXIT_FAILED)
+        }
+    }
+}
+
+/// --open-copy: plays the working copy in `file` in a browser window (see `webcopy::play`) until
+/// that is closed, or Ctrl+C.
+async fn open_copy(file: &Path, ui: &Ui, shutdown: &Shutdown) -> i32 {
+    let mut stop = shutdown.subscribe();
+    let played = tokio::select! {
+        played = webcopy::play(file) => played,
+        () = stop_requested(&mut stop) => Ok(()),
+    };
+    match played {
+        Ok(()) => EXIT_OK,
+        Err(e) => {
+            ui.error(&format!("[FAILED] {}: {}", file.display(), e));
+            EXIT_FAILED
         }
     }
 }

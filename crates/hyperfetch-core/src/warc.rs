@@ -293,6 +293,38 @@ impl Writer {
         Ok(())
     }
 
+    /// Writes the answer a browser got for `url` (its `status`, `headers` and `payload`: its body
+    /// as the browser had it, decoded) as a `response` record, and beside it the browser's
+    /// request as a `request` record: its `method`, the headers it sent and its `body` (a
+    /// form's, a call's). See `crate::webcopy`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exchange(
+        &mut self,
+        url: &Url,
+        date: SystemTime,
+        method: &str,
+        sent: &[(String, String)],
+        body: &[u8],
+        status: u16,
+        headers: &[(String, String)],
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let reason = reqwest::StatusCode::from_u16(status).ok().and_then(|s| s.canonical_reason()).unwrap_or("");
+        let lines = |headers: &[(String, String)]| headers.iter().map(|(name, value)| format!("{name}: {}\r\n", value.replace(['\r', '\n'], " "))).collect::<String>();
+        let text = format!("HTTP/1.1 {status} {reason}\r\n{}\r\n", lines(headers));
+        let mime = headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("content-type")).map_or("unk", |(_, v)| v.as_str()).to_string();
+        let (id, offset, length, digest) = self.record("response", Some(url), date, "application/http;msgtype=response", &[], text.as_bytes(), &mut std::io::Cursor::new(payload))?;
+        self.index_line(url, date, &mime, Some(status), &digest, offset, length);
+        let target = match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_string(),
+        };
+        let request = format!("{method} {target} HTTP/1.1\r\n{}\r\n", lines(sent));
+        let concurrent = [("WARC-Concurrent-To", id)];
+        self.record("request", Some(url), date, "application/http;msgtype=request", &concurrent, request.as_bytes(), &mut std::io::Cursor::new(body))?;
+        Ok(())
+    }
+
     /// Writes `payload`, what `url` held at `date` (a capture the Wayback Machine kept), as a
     /// `resource` record, unless the index has it already.
     pub fn resource(&mut self, url: &Url, date: SystemTime, mime: &str, payload: &mut (impl Read + Seek)) -> Result<(), String> {
@@ -328,6 +360,100 @@ impl Drop for Writer {
             let _ = self.write_index();
         }
     }
+}
+
+/// The SHA-1 of `bytes` as a record's `WARC-Payload-Digest` writes it (`sha1:` and base32).
+pub(crate) fn payload_digest(bytes: &[u8]) -> String {
+    format!("sha1:{}", base32(&Sha1::digest(bytes)))
+}
+
+/// A record of a WARC file as [`scan`] reads it back: where its gzip member starts, and what
+/// its heads say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Stored {
+    pub(crate) offset: u64,
+    /// `response`, `request`, `resource` or `warcinfo`.
+    pub(crate) kind: String,
+    pub(crate) url: String,
+    pub(crate) id: String,
+    /// Of a `request`, the id of the record of its answer.
+    pub(crate) answers: Option<String>,
+    /// The digest of its payload (see [`payload_digest`]): a response's body, a request's.
+    pub(crate) digest: String,
+    /// The first line of its HTTP head: a response's status line, a request's request line.
+    pub(crate) first: String,
+}
+
+/// Every record of the WARC file `path`, in the file's order, read member by member without
+/// keeping any payload. A file cut short (a run that was killed) gives the records before the cut.
+pub(crate) fn scan(path: &Path) -> Result<Vec<Stored>, String> {
+    use std::io::BufRead;
+    let error = |e: std::io::Error| format!("Cannot read {}: {e}", path.display());
+    let mut file = std::io::BufReader::new(std::fs::File::open(path).map_err(error)?);
+    let mut records = Vec::new();
+    loop {
+        let offset = file.stream_position().map_err(error)?;
+        if file.fill_buf().map_err(error)?.is_empty() {
+            break;
+        }
+        let mut member = std::io::BufReader::new(flate2::bufread::GzDecoder::new(&mut file));
+        let mut stored = Stored { offset, ..Stored::default() };
+        let mut line = String::new();
+        let read = (|| {
+            // The record's own head, to its blank line; then the first line of what it holds.
+            loop {
+                line.clear();
+                if member.read_line(&mut line)? == 0 || line.trim_end().is_empty() {
+                    break;
+                }
+                let Some((name, value)) = line.trim_end().split_once(':') else { continue };
+                let value = value.trim().to_string();
+                match name.to_ascii_lowercase().as_str() {
+                    "warc-type" => stored.kind = value,
+                    "warc-target-uri" => stored.url = value,
+                    "warc-record-id" => stored.id = value,
+                    "warc-concurrent-to" => stored.answers = Some(value),
+                    "warc-payload-digest" => stored.digest = value,
+                    _ => {}
+                }
+            }
+            if matches!(stored.kind.as_str(), "response" | "request") {
+                let mut first = Vec::new();
+                member.read_until(b'\n', &mut first)?;
+                stored.first = String::from_utf8_lossy(&first).trim_end().to_string();
+            }
+            std::io::copy(&mut member, &mut std::io::sink())
+        })();
+        if read.is_err() {
+            break;
+        }
+        records.push(stored);
+    }
+    Ok(records)
+}
+
+/// The record whose gzip member starts at `offset` of the WARC file `file`: a `response`'s
+/// status, headers and body; of any other record, status 0 and what it holds whole.
+pub(crate) fn read_at(file: &mut std::fs::File, offset: u64) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let error = |e: std::io::Error| format!("Cannot read the copy: {e}");
+    file.seek(SeekFrom::Start(offset)).map_err(error)?;
+    let mut all = Vec::new();
+    flate2::bufread::GzDecoder::new(std::io::BufReader::new(file)).read_to_end(&mut all).map_err(error)?;
+    let cut = |bytes: &[u8]| bytes.windows(4).position(|w| w == b"\r\n\r\n");
+    let head_end = cut(&all).ok_or("the copy holds a record without a head")?;
+    let head = String::from_utf8_lossy(&all[..head_end]).into_owned();
+    let field = |name: &str| head.lines().find_map(|line| line.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string()));
+    let length: usize = field("Content-Length").and_then(|n| n.parse().ok()).ok_or("the copy holds a record without a length")?;
+    let block = all.get(head_end + 4..head_end + 4 + length).ok_or("the copy holds a record cut short")?;
+    if field("WARC-Type").as_deref() != Some("response") {
+        return Ok((0, Vec::new(), block.to_vec()));
+    }
+    let http_end = cut(block).ok_or("the copy holds an answer without a head")?;
+    let http = String::from_utf8_lossy(&block[..http_end]).into_owned();
+    let mut lines = http.lines();
+    let status = lines.next().and_then(|line| line.split_whitespace().nth(1)).and_then(|code| code.parse().ok()).ok_or("the copy holds an answer without a status")?;
+    let headers = lines.filter_map(|line| line.split_once(':')).map(|(name, value)| (name.trim().to_string(), value.trim().to_string())).collect();
+    Ok((status, headers, block[http_end + 4..].to_vec()))
 }
 
 /// Writes each capture of `lines` (the Wayback manifest's, see `wayback::manifest_line`) whose
@@ -513,5 +639,40 @@ pub(crate) mod tests {
         let kinds: Vec<String> = records(&all).iter().map(|r| r.field("WARC-Type").unwrap().to_string()).collect();
         assert_eq!(kinds, ["warcinfo", "response", "request"]);
         assert!(records(&all)[1].block.ends_with(b"whole"));
+    }
+
+    #[test]
+    fn a_browsers_answer_is_written_with_its_request_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.warc.gz");
+        let url = Url::parse("https://a.example/api/find?q=1").unwrap();
+        let pairs = |list: &[(&str, &str)]| list.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect::<Vec<_>>();
+        let sent = pairs(&[("Content-Type", "application/json"), ("X-Note", "two\nlines")]);
+        let headers = pairs(&[("Content-Type", "text/plain"), ("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")]);
+        let mut writer = Writer::open(&path).unwrap();
+        writer.exchange(&url, SystemTime::now(), "POST", &sent, b"{\"q\":1}", 201, &headers, b"found").unwrap();
+        writer.finish().unwrap();
+
+        let mut all = Vec::new();
+        flate2::read::MultiGzDecoder::new(std::fs::File::open(&path).unwrap()).read_to_end(&mut all).unwrap();
+        let written = records(&all);
+        assert_eq!(written.iter().map(|r| r.field("WARC-Type").unwrap()).collect::<Vec<_>>(), ["warcinfo", "response", "request"]);
+        assert_eq!(written[1].block, b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nfound");
+        // A header's value stays on its line.
+        assert_eq!(written[2].block, b"POST /api/find?q=1 HTTP/1.1\r\nContent-Type: application/json\r\nX-Note: two lines\r\n\r\n{\"q\":1}");
+        assert_eq!(written[2].field("WARC-Concurrent-To"), written[1].field("WARC-Record-ID"));
+        assert_eq!(written[2].field("WARC-Payload-Digest"), Some(payload_digest(b"{\"q\":1}").as_str()));
+        assert!(std::fs::read_to_string(index_path(&path)).unwrap().contains("\"status\":\"201\""));
+
+        let stored = scan(&path).unwrap();
+        assert_eq!(stored.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>(), ["warcinfo", "response", "request"]);
+        assert_eq!((stored[1].url.as_str(), stored[1].first.as_str(), &stored[1].digest), (url.as_str(), "HTTP/1.1 201 Created", &payload_digest(b"found")));
+        assert_eq!((stored[2].first.as_str(), stored[2].answers.as_deref()), ("POST /api/find?q=1 HTTP/1.1", Some(stored[1].id.as_str())));
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(read_at(&mut file, stored[1].offset).unwrap(), (201, headers, b"found".to_vec()));
+        // A file cut short (a run that was killed) gives the records before the cut.
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 10).unwrap();
+        assert_eq!(scan(&path).unwrap().len(), 2);
     }
 }
