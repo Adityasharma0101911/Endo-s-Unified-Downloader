@@ -28,7 +28,7 @@ use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
 use crate::desktop::WhenDone;
 use crate::settings::{Settings, BROWSERS, MEDIA_PRESETS};
 use crate::util::{self, format_bytes, format_duration, lock, Verdict};
-use crate::{Answer, App, Dialog, Origin, Tab, VerifyRequest, GRAPH_WINDOW};
+use crate::{Answer, App, Dialog, Origin, Tab, Take, VerifyRequest, GRAPH_WINDOW};
 
 use add::{add_link, channel_prompt, clipboard_banner, ffmpeg_notice, ffmpeg_prompt, front_door, listing_prompt, notice_banner, undo_toast, update_banner};
 use history::library_page;

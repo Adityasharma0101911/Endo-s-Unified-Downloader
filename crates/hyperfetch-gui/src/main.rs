@@ -30,6 +30,7 @@ use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::ingest::{self, Channel, Task};
 use hyperfetch_core::media;
 use hyperfetch_core::paste;
+use hyperfetch_core::peek;
 use hyperfetch_core::quality::{MediaPick, Qualities};
 use hyperfetch_core::queue::{DownloadQueue, QueueItem, QueueItemStatus};
 use hyperfetch_core::relink;
@@ -185,6 +186,8 @@ enum AppEvent {
     ZipListed { link: String, result: Result<Vec<ZipEntry>, String> },
     /// What yt-dlp told of the media link `link` for its card (see [`App::list_media`]).
     MediaListed { link: String, result: Result<media::MediaInfo, String> },
+    /// What the server of `link` said it is, for its card (see [`App::peek_link`]).
+    Peeked { link: String, result: Result<peek::Peeked, String> },
     /// The songs the Spotify, Apple Music or Deezer link `link` shows (see [`App::read_songs`]).
     SongsRead { link: String, result: Result<catalog::Listing, String> },
     /// What YouTube Music has of the songs at `batch` of `link`'s list (see [`App::find_songs`]).
@@ -237,6 +240,29 @@ impl MediaCard {
     fn music(&self) -> Option<&str> {
         self.listed.as_ref()?.as_ref().ok()?.music.as_deref()
     }
+}
+
+/// The link the Add page's card asked its server about (see [`App::peek_link`]): what it said
+/// (None meanwhile), what a download takes of its page, and the files the page links to, each
+/// with whether it is ticked, listed once `open`.
+struct PeekCard {
+    link: String,
+    found: Option<Result<peek::Peeked, String>>,
+    take: Take,
+    files: Vec<(Url, bool)>,
+    open: bool,
+}
+
+/// What a download takes of a web page (see [`App::page_take`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Take {
+    /// What it holds: the video it plays, else the file it leads to, else the page itself.
+    #[default]
+    Holds,
+    /// The video on it, as yt-dlp finds it.
+    Video,
+    /// The sound of what plays on it, alone.
+    Sound,
 }
 
 /// The Spotify, Apple Music or Deezer link the Add page's card shows the songs of (see
@@ -546,6 +572,8 @@ struct App {
     zip_preview: Option<(String, Option<Result<Vec<(ZipEntry, bool)>, String>>)>,
     /// The qualities of the media link in the link box (see [`App::list_media`]).
     media_card: Option<MediaCard>,
+    /// What the link in the link box is, as its server said, when its text did not (see [`App::peek_link`]).
+    peek: Option<PeekCard>,
     /// The songs of the Spotify, Apple Music or Deezer link in the link box (see [`App::read_songs`]).
     songs_card: Option<SongsCard>,
     /// Keep a saved page's scripts (the link bar's More options), for this session.
@@ -726,6 +754,7 @@ impl App {
             batch_failed: false,
             zip_preview: None,
             media_card: None,
+            peek: None,
             songs_card: None,
             keep_scripts: false,
             saving_page: None,
@@ -803,6 +832,61 @@ impl App {
             self.save_settings();
         }
         options.media_preset = Some(media::MediaQualityPreset::Pick(pick));
+    }
+
+    /// Asks the server of `url`, a link whose text does not say what it is (see `kinds::unsure`),
+    /// for its card: a file's type, name and size, or what a web page holds (see
+    /// `hyperfetch_core::peek`), through the proxy setting. The file itself is not asked for, and
+    /// the form's Authorization header is not sent. It gives up after [`PREVIEW_LIMIT`].
+    fn peek_link(&mut self, url: Url) {
+        let link = url.to_string();
+        self.peek = Some(PeekCard { link: link.clone(), found: None, take: Take::default(), files: Vec::new(), open: false });
+        let options = self.settings.download_options(std::slice::from_ref(&url), "", "");
+        self.spawn_event(async move {
+            let result = tokio::time::timeout(PREVIEW_LIMIT, link_peek(url, options)).await.unwrap_or_else(|_| Err("its server took too long".to_string()));
+            AppEvent::Peeked { link, result }
+        });
+    }
+
+    /// What a download of `urls` takes of the web page its first link is, as chosen on its card
+    /// (see [`Take`]). Its video, or its sound alone, is left to yt-dlp, which a quality set
+    /// sends any link to: the video in the quality the Quality setting names (the best, when
+    /// that names audio alone), the sound in its audio format (MP3, when it names a video's).
+    fn page_take(&self, urls: &[Url], options: &mut DownloadOptions) {
+        use media::MediaQualityPreset::{AudioFlac, AudioM4a, AudioMp3, BestVideoAudio, Pick};
+        let Some(card) = self.peek.as_ref().filter(|card| urls.first().is_some_and(|url| card.link == url.as_str())) else { return };
+        let quality = options.page_media_preset.clone().unwrap_or_default();
+        let audio = match &quality {
+            AudioMp3 | AudioM4a | AudioFlac => true,
+            Pick(pick) => pick.audio.is_some(),
+            _ => false,
+        };
+        options.media_preset = match card.take {
+            Take::Holds => return,
+            Take::Video => Some(if audio { BestVideoAudio } else { quality }),
+            Take::Sound => Some(if audio { quality } else { AudioMp3 }),
+        };
+    }
+
+    /// Queues a download of each file ticked among those the page on the card links to (see
+    /// [`App::peek_link`]), each sent the page as its referer and never the form's Authorization
+    /// header, which is the page's. The first starts and is shown; the others wait in the queue.
+    fn download_page_files(&mut self) {
+        let Some(card) = &self.peek else { return };
+        let Some(Ok(peek::Peeked { landed, .. })) = &card.found else { return };
+        let ticked = card.files.iter().filter(|(_, on)| *on);
+        let tasks: Vec<Task> = ticked.map(|(url, _)| Task { urls: vec![url.clone()], from_document: true, referer: Some(landed.to_string()), ..Task::default() }).collect();
+        if tasks.is_empty() {
+            return;
+        }
+        let link = card.link.clone();
+        self.form_error = None;
+        if self.add_listing(Origin::Form, &link, "", "", Ok(tasks)) {
+            self.tab = Tab::Downloads;
+            if let Some(card) = self.peek.as_mut() {
+                card.files.iter_mut().for_each(|(_, on)| *on = false);
+            }
+        }
     }
 
     /// The proxy of the settings, when one is set.
@@ -1120,6 +1204,7 @@ impl App {
         let task = ingest::link_task(&ingest::split_tokens(text))?;
         let mut options = task_options(&self.settings, &task, checksum, auth)?;
         self.card_pick(&task.urls, &mut options);
+        self.page_take(&task.urls, &mut options);
         let id = queue_task(&mut self.queue, task, options);
         self.look_for_twin(id);
         Ok(id)
@@ -2370,6 +2455,14 @@ impl App {
                     card.listed = Some(result);
                 }
             }
+            AppEvent::Peeked { link, result } => {
+                if let Some(card) = self.peek.as_mut().filter(|card| card.link == link) {
+                    if let Ok(peek::Peeked { what: peek::Peek::Page(page), .. }) = &result {
+                        card.files = page.files.iter().map(|url| (url.clone(), false)).collect();
+                    }
+                    card.found = Some(result);
+                }
+            }
             AppEvent::SongsRead { link, result } => self.songs_read(link, result),
             AppEvent::SongsFound { link, batch, result } => self.songs_found(link, batch, result),
             AppEvent::SongsQueued { link, title, result } => self.songs_queued(link, title, result),
@@ -3225,6 +3318,41 @@ async fn media_listing(url: &Url, _cookies: media::BrowserCookieSource, _proxy: 
     let info = media::media_info(&serde_json::from_str(found).map_err(|e| e.to_string())?);
     let music = hyperfetch_core::music::kind(url).map(|_| "A song by Sample Artist".to_string());
     Ok(media::MediaInfo { music, ..info })
+}
+
+/// What the server of `url` says it is (see `peek::peek`), asked as a download with `options`
+/// would ask (its proxy, its User-Agent).
+#[cfg(not(test))]
+async fn link_peek(url: Url, options: Result<DownloadOptions, String>) -> Result<peek::Peeked, String> {
+    let options = options?;
+    let client = unblock(move || build_client(&options)).await??;
+    peek::peek(&client, &url).await
+}
+
+/// A stand-in for `peek::peek` that asks no server, by what the link says: `peek-song` is a
+/// sound file its server names, `peek-page` a page with a video and two files, `peek-bare` a
+/// page that holds nothing, `peek-short` a short link that lands on a video's page; any other
+/// link's server does not answer.
+#[cfg(test)]
+async fn link_peek(url: Url, _options: Result<DownloadOptions, String>) -> Result<peek::Peeked, String> {
+    let link = |text: &str| Url::parse(text).expect("a link");
+    let text = url.to_string();
+    let page = |landed: Url, page: peek::Page| Ok(peek::Peeked { landed, what: peek::Peek::Page(page) });
+    if text.contains("peek-song") {
+        let file = peek::File { name: Some("My Song.mp3".to_string()), mime: "audio/mpeg".to_string(), size: Some(4 << 20) };
+        return Ok(peek::Peeked { landed: url, what: peek::Peek::File(file) });
+    }
+    if text.contains("peek-page") {
+        let files = vec![link("https://files.example/a/report.pdf"), link("https://files.example/a/pack.zip")];
+        return page(url, peek::Page { title: Some("Sample page".to_string()), video: true, sound: false, files });
+    }
+    if text.contains("peek-bare") {
+        return page(url, peek::Page { title: Some("Plain words".to_string()), ..Default::default() });
+    }
+    if text.contains("peek-short") {
+        return page(link("https://www.youtube.com/watch?v=aqz-KE-bpKQ"), peek::Page { video: true, ..Default::default() });
+    }
+    Err("no answer".to_string())
 }
 
 /// YouTube Music, whose songs a Spotify, Apple Music or Deezer list's are: the audio chosen on its

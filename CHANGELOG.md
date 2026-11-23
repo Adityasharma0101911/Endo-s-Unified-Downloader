@@ -2,6 +2,12 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
+## Unreleased
+
+- **A link says what it is.** A link whose text does not say (no site the app knows, no file's extension: `example.com/download?id=5`, a wiki's `Node.js`) asks its server once it has stood still in the link bar for half a second. One HEAD request, which takes none of the file, tells a file: its card then names it a file, with the name, sort (Sound, Video, PDF document…) and size its server gave. A web page is read for what it holds, and its card says so: its title, whether it plays a video or sound, how many files it links to. A short link that lands on a site the app knows says where it leads, with Use that link.
+- **Take, on a web page's card.** What it holds (as before: the video it plays, else the file it leads to, else the page), Its video or Its sound. The last two leave the page to yt-dlp: the video in the Quality setting's quality, the sound as MP3, or in the audio format that setting names. See its files lists the files the page links to, to tick; Download selected queues those ticked, each a download of its own.
+- **No made-up name on a share page's card.** A Google Drive or MediaFire file link showed the last part of its address (`view`, `file`) as its name. The name now comes from the site once it starts.
+
 ## 2.2.6 (2026-11-22)
 
 - **FLAC, said as it is.** The FLAC choice is no longer called lossless: where a site has no FLAC of its own, its audio is converted to FLAC, which adds no quality. The card says "converted from Opus", as it does for MP3; Settings says "Audio Only (FLAC)"; `--media-preset lossless` is gone (`flac` stays).

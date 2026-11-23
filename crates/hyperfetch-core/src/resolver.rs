@@ -1552,7 +1552,7 @@ pub fn start_is_no_page(start: &[u8]) -> bool {
 }
 
 /// The name of the file `url` names by one of the [`FILE_EXTENSIONS`], if it does.
-fn named_file(url: &Url) -> Option<String> {
+pub fn named_file(url: &Url) -> Option<String> {
     let ext = last_segment_extension(url)?;
     let last = url.path_segments()?.next_back()?;
     FILE_EXTENSIONS

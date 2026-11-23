@@ -6662,7 +6662,7 @@ fn has_known_extension(name: &str) -> bool {
 }
 
 /// The usable file name in a response's Content-Disposition, if it has one.
-fn disposition_name(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn disposition_name(headers: &HeaderMap) -> Option<String> {
     let value = String::from_utf8_lossy(headers.get(CONTENT_DISPOSITION)?.as_bytes()).into_owned();
     content_disposition_filename(&value)
         .map(|name| sanitize_filename(&name))

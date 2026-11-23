@@ -44,6 +44,7 @@ pub mod gallery;
 pub mod gentle;
 pub mod postprocess;
 pub mod paste;
+pub mod peek;
 pub mod ftp;
 pub mod sftp;
 pub mod oci;

@@ -500,6 +500,34 @@ pub fn recognise(text: &str) -> Option<(&'static Kind, String)> {
     Some((kind, source))
 }
 
+/// The kind named `name`.
+pub fn named(name: &str) -> Option<&'static Kind> {
+    KINDS.iter().find(|kind| kind.name == name)
+}
+
+/// The single http(s) link `text` is, when its text alone does not say what it is: a web page
+/// only because nothing else took it, or a file only by a dot in its name that no file's
+/// extension follows (`report.php?id=3`, a wiki's `Node.js`). Its server is asked (see
+/// `hyperfetch_core::peek`): the link bar's card then says what it is and what it holds. Not one
+/// whose host is a bare word (`https://exa`): a link still being typed is asked of nobody.
+pub fn unsure(text: &str) -> Option<Url> {
+    let text = text.trim();
+    let url = Url::parse(text).ok().filter(|url| matches!(url.scheme(), "http" | "https") && !text.contains(char::is_whitespace))?;
+    let whole = match url.host()? {
+        url::Host::Domain(name) => name.contains('.') || name == "localhost",
+        _ => true,
+    };
+    if !whole {
+        return None;
+    }
+    let sure = match recognise(text)?.0.name {
+        "A web page" => false,
+        "A file" => resolver::named_file(&url).is_some() || resolver::SmartResolver::handles(&url),
+        _ => true,
+    };
+    (!sure).then_some(url)
+}
+
 /// Several links, a line each.
 pub static SEVERAL: Kind = Kind {
     name: "Several links",
@@ -573,6 +601,44 @@ mod tests {
             assert!(!named_by_link(recognise(text).unwrap().0), "{text}");
         }
         assert!(named_by_link(recognise("https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz").unwrap().0));
+    }
+
+    /// A link's server is asked what it is only where its text leaves that open: a page that
+    /// nothing else took, or a name with a dot that no file's extension follows.
+    #[test]
+    fn only_a_link_whose_text_does_not_say_is_asked() {
+        for text in [
+            "https://example.com/",
+            "https://example.com/download?id=5",
+            "https://example.com/about/index.html",
+            "https://example.com/report.php?id=3",
+            "https://en.wikipedia.org/wiki/Node.js",
+            "https://bit.ly/3abcde",
+            "http://127.0.0.1:8080/get",
+            "http://localhost/get",
+        ] {
+            assert_eq!(unsure(text).map(|url| url.to_string()).as_deref(), Some(text), "{text}");
+        }
+        for text in [
+            "",
+            "not a link",
+            "https://exa",
+            "https://example.com/a.iso",
+            "https://example.com/pack.zip",
+            "https://example.com/song.mp3",
+            "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+            "https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543",
+            "https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz012345/view",
+            "https://github.com/sharkdp/fd/releases/latest",
+            "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c",
+            "ftp://ftp.example/pub/a.dat",
+            "https://a.example/f.dat https://b.example/f.dat",
+            "https://a.example/1\nhttps://a.example/2",
+        ] {
+            assert_eq!(unsure(text), None, "{text}");
+        }
+        assert_eq!(named("A file").map(|kind| kind.choice), Some(Choice::None));
+        assert_eq!(named("A web page").map(|kind| kind.choice), Some(Choice::Page));
     }
 
     /// Every kind's example is named as that kind (or a more particular one in its group), and

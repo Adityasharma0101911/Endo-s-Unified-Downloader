@@ -1,4 +1,5 @@
 use hyperfetch_core::zipdir::ZipEntry;
+use hyperfetch_core::{peek, resolver};
 use url::Url;
 
 use super::*;
@@ -355,7 +356,7 @@ pub(super) fn front_door(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     let id = egui::Id::new("url_input");
     let lit = anim::presence(&ctx, id.with("lit"), ctx.memory(|m| m.has_focus(id)) || !app.url_input.trim().is_empty(), 0.22);
-    let recognised = kinds::recognise(&app.url_input);
+    let recognised = card_kind(app);
     let glyph = recognised.as_ref().map_or(icon::LINK, |(kind, _)| kind.glyph);
     let frame = Frame::none()
         .fill(p.card)
@@ -411,6 +412,12 @@ pub(super) fn front_door(app: &mut App, ui: &mut Ui) {
 /// goes, and More options.
 fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
     let p = palette(ui);
+    // A link whose text does not say what it is: its server is asked, and the card says the rest.
+    let unsure = kinds::unsure(&app.url_input);
+    ask_link(app, ui, unsure.as_ref());
+    let asked = unsure.as_ref().and_then(|url| app.peek.as_ref().filter(|card| card.link == url.as_str()));
+    let asking = asked.is_some_and(|card| card.found.is_none());
+    let found = asked.and_then(|card| card.found.as_ref()?.as_ref().ok()).cloned();
     card(ui).inner_margin(Margin::symmetric(18.0, 14.0)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -427,13 +434,38 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
                 });
                 // A file's link ends in its name; a video page's ends in "watch": the site names it,
                 // as soon as its qualities are read.
-                match listed_title(app).or_else(|| shown_name(&app.url_input, kind)) {
+                // What its server names it: a file's name, a page's title.
+                let told = found.as_ref().and_then(|found| match &found.what {
+                    peek::Peek::File(file) => file.name.clone(),
+                    peek::Peek::Page(page) => page.title.clone(),
+                });
+                match told.or_else(|| listed_title(app)).or_else(|| shown_name(&app.url_input, kind)) {
                     Some(name) => {
                         ui.add(egui::Label::new(RichText::new(&name).color(p.text)).truncate()).on_hover_text(&name);
                     }
+                    None if asking => {}
                     None if kind.name != kinds::SEVERAL.name => {
                         let what = if kind.choice == kinds::Choice::Quality { "Its title" } else { "Its name" };
                         ui.label(RichText::new(format!("{what} comes from the site once it starts")).color(p.muted));
+                    }
+                    None => {}
+                }
+                if asking {
+                    ui.horizontal(|ui| {
+                        anim::spinner(ui, 14.0, p.muted);
+                        ui.label(RichText::new("Asking the site what this is…").color(p.muted));
+                    });
+                }
+                match found.as_ref().map(|found| &found.what) {
+                    // The sort of file its server says it is, and its size.
+                    Some(peek::Peek::File(file)) => {
+                        let facts: Vec<String> = file.sort().map(str::to_string).into_iter().chain(file.size.map(format_bytes)).collect();
+                        if !facts.is_empty() {
+                            ui.label(RichText::new(facts.join(" · ")).color(p.text));
+                        }
+                    }
+                    Some(peek::Peek::Page(page)) => {
+                        ui.add(egui::Label::new(RichText::new(page_holds(page)).color(p.text)).wrap());
                     }
                     None => {}
                 }
@@ -453,6 +485,9 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
         let picker = kind.choice == kinds::Choice::Quality && quality_picker(app, ui);
         if kind.choice == kinds::Choice::Songs {
             songs_card(app, ui);
+        }
+        if kind.choice == kinds::Choice::Page {
+            page_take(app, ui, unsure.as_ref());
         }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -515,8 +550,152 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
     });
 }
 
+/// What the link bar holds, as its card names it (see `kinds::recognise`): a link whose text left
+/// that open (see `kinds::unsure`) is the file or the web page its server said it is, once it
+/// has (see `App::peek_link`).
+fn card_kind(app: &App) -> Option<(&'static kinds::Kind, String)> {
+    let (kind, source) = kinds::recognise(&app.url_input)?;
+    let asked = app.peek.as_ref().filter(|card| card.found.as_ref().is_some_and(|found| found.is_ok()));
+    let told = asked.filter(|card| kinds::unsure(&app.url_input).is_some_and(|url| card.link == url.as_str())).and_then(|card| match card.found.as_ref()?.as_ref().ok()?.what {
+        peek::Peek::File(_) => kinds::named("A file"),
+        peek::Peek::Page(_) => kinds::named("A web page"),
+    });
+    Some((told.unwrap_or(kind), source))
+}
+
+/// For a link in the box whose text does not say what it is, `unsure` (see `kinds::unsure`):
+/// asks its server once it has stood still for half a second (see `App::peek_link`).
+fn ask_link(app: &mut App, ui: &mut Ui, unsure: Option<&Url>) {
+    let Some(url) = unsure.filter(|url| !app.peek.as_ref().is_some_and(|card| card.link == url.as_str())) else { return };
+    let (id, now) = (egui::Id::new("unsure link seen"), ui.input(|i| i.time));
+    match ui.data(|d| d.get_temp::<(String, f64)>(id)) {
+        Some((seen, at)) if seen == url.as_str() && now - at >= LISTING_WAIT => app.peek_link(url.clone()),
+        Some((seen, at)) if seen == url.as_str() => ui.ctx().request_repaint_after(Duration::from_secs_f64(LISTING_WAIT - (now - at))),
+        _ => {
+            ui.data_mut(|d| d.insert_temp(id, (url.to_string(), now)));
+            ui.ctx().request_repaint_after(Duration::from_secs_f64(LISTING_WAIT));
+        }
+    }
+}
+
+/// What a page read for its card holds, in a line (see `App::peek_link`).
+fn page_holds(page: &peek::Page) -> String {
+    let files = match page.files.len() {
+        0 => None,
+        1 => Some("1 file".to_string()),
+        n => Some(format!("{n} files")),
+    };
+    let parts: Vec<String> = [page.video.then(|| "a video".to_string()), page.sound.then(|| "sound".to_string()), files].into_iter().flatten().collect();
+    match &parts[..] {
+        [] => "No video, sound or files were seen on this page: Download saves the page itself, unless yt-dlp knows the site".to_string(),
+        [one] => format!("On this page: {one}"),
+        [first @ .., last] => format!("On this page: {} and {last}", first.join(", ")),
+    }
+}
+
+/// For a web page in the box whose server was asked (see `App::peek_link`): what Download takes
+/// of it (what it holds, its video, or its sound alone); where its link leads, when that is a
+/// kind of its own, with Use that link; and the files it links to, listed to tick once asked for
+/// (see [`page_files`]).
+fn page_take(app: &mut App, ui: &mut Ui, unsure: Option<&Url>) {
+    let p = palette(ui);
+    let Some(url) = unsure else { return };
+    let Some(card) = app.peek.as_mut().filter(|card| card.link == url.as_str()) else { return };
+    ui.horizontal_wrapped(|ui| {
+        ui.add_sized([62.0, 22.0], egui::Label::new(bold("Take").color(p.text)));
+        let choices = [
+            (Take::Holds, "What it holds", "The video it plays, else the file it leads to, else the page itself"),
+            (Take::Video, "Its video", "The video on it, as yt-dlp finds it, in the quality the Quality setting names"),
+            (Take::Sound, "Its sound", "The sound of what plays on it alone, as yt-dlp finds it: as MP3, or in the audio format the Quality setting names"),
+        ];
+        for (take, name, tip) in choices {
+            if ui.selectable_label(card.take == take, name).on_hover_text(tip).clicked() {
+                card.take = take;
+            }
+        }
+    });
+    // A short link, or one that redirects, to something the app knows better than as a page.
+    let landed = card.found.as_ref().and_then(|found| found.as_ref().ok()).map(|found| &found.landed).filter(|landed| landed.host_str() != url.host_str());
+    let leads = landed.and_then(|landed| {
+        let (kind, source) = kinds::recognise(landed.as_str())?;
+        (!matches!(kind.name, "A web page" | "A file")).then(|| (landed.to_string(), kind.name, source))
+    });
+    let mut used = None;
+    if let Some((landed, name, source)) = leads {
+        ui.horizontal_wrapped(|ui| {
+            let what = match name.split_once(' ') {
+                Some((article @ ("A" | "An"), rest)) => format!("{} {rest}", article.to_lowercase()),
+                _ => name.to_lowercase(),
+            };
+            ui.label(RichText::new(format!("It leads to {what} on {source}")).color(p.text));
+            if ui.add(button("Use that link")).on_hover_text(&landed).clicked() {
+                used = Some(landed);
+            }
+        });
+    }
+    let mut go = false;
+    if !card.files.is_empty() {
+        let label = match (card.open, card.files.len()) {
+            (true, _) => "Hide its files".to_string(),
+            (false, 1) => format!("{} See its 1 file", icon::LIST_CHECKS),
+            (false, n) => format!("{} See its {n} files", icon::LIST_CHECKS),
+        };
+        if ui.add(button(label)).on_hover_text("The files this page links to, to tick and download").clicked() {
+            card.open = !card.open;
+        }
+        if card.open {
+            go = page_files(ui, &mut card.files);
+        }
+    }
+    ui.add_space(4.0);
+    if let Some(link) = used {
+        app.url_input = link;
+    }
+    if go {
+        app.download_page_files();
+    }
+}
+
+/// The files a page links to, a line each in a list that scrolls past twelve of them: its name
+/// with a box to tick, and the site it is on; then All, how many are ticked, and Download
+/// selected (see `App::download_page_files`). True when that was clicked.
+fn page_files(ui: &mut Ui, files: &mut [(Url, bool)]) -> bool {
+    let p = palette(ui);
+    let row = ui.spacing().interact_size.y;
+    let most = 12.0 * (row + ui.spacing().item_spacing.y);
+    egui::ScrollArea::vertical().id_salt("page files").max_height(most).auto_shrink([false, true]).show_rows(ui, row, files.len(), |ui, rows| {
+        for (url, on) in &mut files[rows] {
+            ui.horizontal(|ui| {
+                left_part(ui, 180.0, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    let name = url.path_segments().and_then(|mut parts| parts.next_back()).map(percent_decoded).unwrap_or_default();
+                    ui.checkbox(on, RichText::new(name).color(p.text)).on_hover_text(url.as_str());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(url.host_str().unwrap_or_default()).color(p.muted)));
+            });
+        }
+    });
+    let ticked = files.iter().filter(|(_, on)| *on).count();
+    let mut go = false;
+    ui.horizontal(|ui| {
+        let mut all = ticked == files.len();
+        if ui.checkbox(&mut all, "All").changed() {
+            files.iter_mut().for_each(|(_, on)| *on = all);
+        }
+        ui.label(RichText::new(format!("{ticked} of {} ticked", files.len())).small().color(p.muted));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let download = primary_button(&format!("{} Download selected", icon::DOWNLOAD_SIMPLE), p.accent);
+            let hint = "Download the ticked files, each a download of its own";
+            go = ui.add_enabled(ticked > 0, download).on_hover_text(hint).on_disabled_hover_text("Tick the files to download first").clicked();
+        });
+    });
+    go
+}
+
 /// The name the input gives what it downloads, shown on the preview card: a magnet's own name, or
 /// the last part of a link of a `kind` that ends in its file's name (see `kinds::named_by_link`).
+/// A share page's link ends in its address there (`/file/d/<id>/view`), not in its file's name:
+/// that one comes from the site.
 fn shown_name(input: &str, kind: &kinds::Kind) -> Option<String> {
     // A link with ranges: how many links, from the first file to the last.
     if let Ok(Some((count, first, last))) = kinds::range_span(input) {
@@ -535,6 +714,9 @@ fn shown_name(input: &str, kind: &kinds::Kind) -> Option<String> {
         return url.query_pairs().find(|(key, _)| key == "dn").map(|(_, name)| name.into_owned()).filter(|name| !name.trim().is_empty());
     }
     let url = Some(url).filter(|url| kinds::named_by_link(kind) && matches!(url.scheme(), "http" | "https" | "ftp" | "ftps" | "sftp"))?;
+    if resolver::SmartResolver::handles(&url) && resolver::named_file(&url).is_none() {
+        return None;
+    }
     let last = url.path_segments()?.filter(|s| !s.is_empty()).next_back()?;
     let name = percent_decoded(last);
     (!name.is_empty()).then_some(name)
@@ -1119,7 +1301,7 @@ fn advanced_options(app: &mut App, ui: &mut Ui) {
             ui.label(text);
         })
     };
-    if kinds::recognise(&app.url_input).is_some_and(|(kind, _)| kind.choice == kinds::Choice::Page) {
+    if card_kind(app).is_some_and(|(kind, _)| kind.choice == kinds::Choice::Page) {
         ui.horizontal(|ui| {
             label(ui, "Saved page");
             let tip = "Put the page's scripts in the saved file too, where they run when it is opened. Left out, the file shows the \
@@ -1217,6 +1399,9 @@ mod tests {
         h.frames(30);
         assert!(h.find("A web page").is_some() && h.find("Its name comes from the site once it starts").is_some(), "{:?}", h.texts());
         assert!(h.find("about.html").is_none(), "no name made up from the link");
+        // Its server is asked what it is first: the card's rows move as that comes.
+        asked(&mut h);
+        assert!(h.find("Its name comes from the site once it starts").is_some(), "{:?}", h.texts());
         h.click("Save this page as one file");
         assert!(h.app.saving_page.is_some());
         h.wait_for(|app| app.saving_page.is_none());
@@ -1436,6 +1621,8 @@ mod tests {
         assert_eq!(named("https://www.youtube.com/@BlenderOfficial/videos"), None);
         assert_eq!(named("https://arxiv.org/abs/1706.03762"), None);
         assert_eq!(named("https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543"), None);
+        // A share page's link ends in its address there, not in its file's name.
+        assert_eq!(named("https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz012345/view"), None);
         assert_eq!(named("https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz").as_deref(), Some("hello-2.12.1.tar.gz"));
         assert_eq!(named("magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny").as_deref(), Some("Big Buck Bunny"));
         let mut h = Harness::new();
@@ -1853,5 +2040,94 @@ mod tests {
         let item = &h.app.queue.items()[0];
         assert_eq!(item.urls[0].as_str(), "https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543");
         assert_eq!(item.options.media_preset, None);
+    }
+
+    /// Frames until the link in the box has stood still long enough to be asked what it is, and
+    /// its server's answer (see `link_peek`'s stand-in) is on its card.
+    fn asked(h: &mut Harness) {
+        h.frames(40);
+        h.wait_for(|app| app.peek.as_ref().is_some_and(|card| card.found.is_some()));
+        h.frames(5);
+    }
+
+    /// A link whose text does not say what it is asks its server once it has stood still: one
+    /// without an extension that is a file is named a file, with the name, sort and size its
+    /// server gave and none of a page's choices. A link that names a file is not asked.
+    #[test]
+    fn a_link_that_does_not_say_what_it_is_asks_its_server() {
+        let mut h = Harness::new();
+        h.app.url_input = "https://files.example/peek-song?id=5".to_string();
+        h.frames(10);
+        assert!(h.find("A web page").is_some() && h.app.peek.is_none(), "not asked while it may still be typed");
+        asked(&mut h);
+        assert!(h.find("A file").is_some() && h.find("A web page").is_none(), "{:?}", h.texts());
+        assert!(h.find("My Song.mp3").is_some() && h.find("Sound · 4.00 MiB").is_some(), "{:?}", h.texts());
+        assert!(h.find("Save this page as one file").is_none() && h.find("Take").is_none(), "{:?}", h.texts());
+        start_from_form(&mut h.app);
+        assert_eq!(h.app.queue.items()[0].options.media_preset, None);
+
+        let mut h = Harness::new();
+        h.app.url_input = "https://files.example/a.iso".to_string();
+        h.frames(60);
+        assert!(h.app.peek.is_none() && h.find("A file").is_some(), "{:?}", h.texts());
+    }
+
+    /// A web page's card says what its server showed it holds, and Take says what Download takes
+    /// of it: what it holds (no quality set, the engine looks), or its video or its sound alone,
+    /// left to yt-dlp in the Quality setting's quality or as MP3.
+    #[test]
+    fn a_page_says_what_it_holds_and_download_takes_what_is_chosen() {
+        use media::MediaQualityPreset::{AudioMp3, BestVideoAudio};
+        for (choice, preset) in [(None, None), (Some("Its video"), Some(BestVideoAudio)), (Some("Its sound"), Some(AudioMp3))] {
+            let mut h = Harness::new();
+            h.app.url_input = "https://site.example/peek-page".to_string();
+            asked(&mut h);
+            assert!(h.find("A web page").is_some() && h.find("Sample page").is_some(), "{:?}", h.texts());
+            assert!(h.find("On this page: a video and 2 files").is_some() && h.find("Save this page as one file").is_some(), "{:?}", h.texts());
+            if let Some(choice) = choice {
+                h.click(choice);
+            }
+            start_from_form(&mut h.app);
+            assert_eq!(h.app.queue.items()[0].options.media_preset, preset, "{choice:?}");
+        }
+        let mut h = Harness::new();
+        h.app.url_input = "https://site.example/peek-bare".to_string();
+        asked(&mut h);
+        assert!(h.find("Plain words").is_some(), "{:?}", h.texts());
+        assert!(h.texts().iter().any(|(text, _)| text.starts_with("No video, sound or files were seen on this page")), "{:?}", h.texts());
+    }
+
+    /// The files a page links to are listed to tick once asked for; Download selected queues the
+    /// ticked ones alone, each sent the page as its referer.
+    #[test]
+    fn the_files_a_page_links_to_are_ticked_and_downloaded() {
+        let mut h = Harness::new();
+        h.app.url_input = "https://site.example/peek-page".to_string();
+        asked(&mut h);
+        assert!(h.find("report.pdf").is_none(), "{:?}", h.texts());
+        h.click("See its 2 files");
+        h.frames(3);
+        assert!(h.find("report.pdf").is_some() && h.find("pack.zip").is_some() && h.find("0 of 2 ticked").is_some(), "{:?}", h.texts());
+        h.click("pack.zip");
+        h.frames(3);
+        assert!(h.find("1 of 2 ticked").is_some(), "{:?}", h.texts());
+        h.click("Download selected");
+        let items = h.app.queue.items();
+        assert_eq!(items.iter().map(|item| item.urls[0].as_str()).collect::<Vec<_>>(), ["https://files.example/a/pack.zip"]);
+        assert_eq!(items[0].options.referer.as_deref(), Some("https://site.example/peek-page"));
+    }
+
+    /// A short link that lands on a kind of its own says where it leads; Use that link puts that
+    /// link in the box, whose card is then that kind's.
+    #[test]
+    fn a_link_that_leads_elsewhere_offers_where_it_lands() {
+        let mut h = Harness::new();
+        h.app.url_input = "https://sho.example/peek-short".to_string();
+        asked(&mut h);
+        assert!(h.find("It leads to a video on youtube.com").is_some(), "{:?}", h.texts());
+        h.click("Use that link");
+        assert_eq!(h.app.url_input, "https://www.youtube.com/watch?v=aqz-KE-bpKQ");
+        h.frames(3);
+        assert!(h.find("A video").is_some(), "{:?}", h.texts());
     }
 }
