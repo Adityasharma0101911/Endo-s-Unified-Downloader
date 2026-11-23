@@ -2,6 +2,12 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
+## 2.2.6 (2026-11-22)
+
+- **FLAC, said as it is.** The FLAC choice is no longer called lossless: where a site has no FLAC of its own, its audio is converted to FLAC, which adds no quality. The card says "converted from Opus", as it does for MP3; Settings says "Audio Only (FLAC)"; `--media-preset lossless` is gone (`flac` stays).
+- **`--audio-tag` keeps a file's own tags.** It names the title and artist from the file name only where the file has none. Before, it replaced the ones a download came with.
+- **`--audio-normalize` keeps the cover.** An M4A with a cover failed, and an MP3's or FLAC's cover was encoded again: the cover now goes along as it is. The result is 48 kHz (a FLAC came out at 192 kHz, many times its size). An Opus or Ogg file that has a cover is left as it is, with a note, because ffmpeg cannot write a cover into one.
+
 ## 2.2.5 (2026-11-22)
 
 - **Audio as FLAC.** A FLAC choice beside MP3 and M4A on a media card, in Settings and as `--media-preset flac`: a site's own FLAC where it offers one, else its audio converted to FLAC, which adds no quality the site's audio did not have.
