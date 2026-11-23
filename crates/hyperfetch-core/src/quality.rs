@@ -100,7 +100,7 @@ pub enum AudioForm {
     Original,
     Mp3,
     M4a,
-    /// Bit-perfect lossless FLAC or original master audio.
+    /// FLAC: the site's own where it has one, else its audio converted, which adds no quality.
     Flac,
 }
 
@@ -323,7 +323,7 @@ impl Qualities {
             AudioForm::Mp3 => best.map_or_else(|| "converted".to_string(), |a| format!("converted from {}", a.codec)),
             AudioForm::Flac => match self.audio.iter().find(|a| a.codec == "FLAC" && language.is_none_or(|l| a.language.as_deref() == Some(l))) {
                 Some(flac) => format!("{}, not converted", said(flac)),
-                None => best.map_or_else(|| "FLAC (lossless)".to_string(), |a| format!("FLAC (lossless) / from {}", a.codec)),
+                None => best.map_or_else(|| "converted".to_string(), |a| format!("converted from {}", a.codec)),
             },
         }
     }
@@ -468,7 +468,7 @@ impl MediaPick {
             Some(AudioForm::Original) => "Audio as the site has it".to_string(),
             Some(AudioForm::Mp3) => "Audio as MP3".to_string(),
             Some(AudioForm::M4a) => "Audio as M4A".to_string(),
-            Some(AudioForm::Flac) => "Audio as FLAC (Lossless)".to_string(),
+            Some(AudioForm::Flac) => "Audio as FLAC".to_string(),
             None => {
                 let mut what = self.up_to.map_or_else(|| "The best video".to_string(), |n| format!("Up to {n}p"));
                 if let Some(codec) = &self.codec {
@@ -757,7 +757,7 @@ mod tests {
                 "  original          Opus 129 kbps · 9.7 MiB",
                 "  m4a               AAC 129 kbps, not converted",
                 "  mp3               converted from Opus",
-                "  flac              FLAC (lossless) / from Opus"
+                "  flac              converted from Opus"
             ]
         );
     }

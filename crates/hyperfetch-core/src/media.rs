@@ -42,7 +42,7 @@ pub enum MediaQualityPreset {
     AudioMp3,
     /// Extract audio only as high quality M4A / AAC
     AudioM4a,
-    /// Extract audio as lossless FLAC (or download original lossless master)
+    /// Audio only as FLAC: the site's own where it has one, else its audio converted
     AudioFlac,
     /// Custom yt-dlp format selector string
     Custom(String),

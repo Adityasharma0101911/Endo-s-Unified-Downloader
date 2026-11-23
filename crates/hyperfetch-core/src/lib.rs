@@ -14,7 +14,6 @@ pub mod relink;
 pub mod media;
 pub mod music;
 pub mod catalog;
-pub mod deezer;
 pub mod qobuz;
 pub mod quality;
 pub mod history;

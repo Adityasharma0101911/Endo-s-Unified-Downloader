@@ -375,11 +375,12 @@ pub struct Args {
     #[arg(long = "virustotal-key", value_name = "KEY", env = "VIRUSTOTAL_API_KEY", hide_env_values = true)]
     pub virustotal_key: Option<String>,
 
-    /// Normalize audio loudness to EBU R128 (-14 LUFS / ReplayGain) via ffmpeg
+    /// Normalize audio loudness to EBU R128 (-14 LUFS / ReplayGain) via ffmpeg: the file is
+    /// encoded again, at 48 kHz, its tags and cover kept
     #[arg(long = "audio-normalize", aliases = ["normalize-audio", "loudnorm"])]
     pub audio_normalize: bool,
 
-    /// Tag audio metadata (title, artist, album) via ffmpeg
+    /// Name an audio file's title and artist from its file name where it has none, via ffmpeg
     #[arg(long = "audio-tag", aliases = ["tag-audio", "id3-tag"])]
     pub audio_tag: bool,
 
@@ -1041,7 +1042,7 @@ pub fn parse_media_preset(s: &str) -> Result<MediaQualityPreset, String> {
         "720p" | "720" | "hd" => MediaQualityPreset::Hd720p,
         "mp3" => MediaQualityPreset::AudioMp3,
         "m4a" | "aac" => MediaQualityPreset::AudioM4a,
-        "flac" | "lossless" => MediaQualityPreset::AudioFlac,
+        "flac" => MediaQualityPreset::AudioFlac,
         // A quality as --list-tracks names it, else a format selector of yt-dlp's own.
         _ => MediaPick::parse(s).map_or_else(|_| MediaQualityPreset::Custom(s.to_string()), MediaQualityPreset::Pick),
     })

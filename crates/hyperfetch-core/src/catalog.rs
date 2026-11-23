@@ -797,60 +797,6 @@ where
     Ok(verdicts)
 }
 
-/// Attempts to find a bit-perfect lossless match for `song`.
-/// Prioritizes Qobuz 24-bit Hi-Res audio (Tier 1), falling back to Deezer 16-bit FLAC (Tier 2).
-pub async fn find_lossless(http: &reqwest::Client, song: &Song) -> Option<Found> {
-    // Tier 1: Try Qobuz Hi-Res lossless (24-bit/96kHz - 192kHz) first via ISRC or search
-    if let Some(isrc) = &song.isrc {
-        if let Ok(Some(track)) = crate::qobuz::resolve_isrc(http, isrc).await {
-            return Some(Found {
-                id: format!("https://play.qobuz.com/track/{}", track.id),
-                title: track.title,
-                artist: track.artist,
-                seconds: Some(track.duration),
-            });
-        }
-    }
-    let artist = song.artists.first().map(String::as_str).unwrap_or("");
-    if let Ok(Some(track)) = crate::qobuz::search_track(http, artist, &song.title).await {
-        let alike = similarity(&core_title(&song.title), &core_title(&track.title));
-        let apart = song.seconds.map(|s| (s - track.duration).abs());
-        if alike >= 0.85 && apart.is_none_or(|a| a <= SURE_APART) {
-            return Some(Found {
-                id: format!("https://play.qobuz.com/track/{}", track.id),
-                title: track.title,
-                artist: track.artist,
-                seconds: Some(track.duration),
-            });
-        }
-    }
-
-    // Tier 2: Fall back to Deezer 16-bit lossless FLAC
-    if let Some(isrc) = &song.isrc {
-        if let Ok(Some(track)) = crate::deezer::resolve_isrc(http, isrc).await {
-            return Some(Found {
-                id: format!("https://www.deezer.com/track/{}", track.id),
-                title: track.title,
-                artist: track.artist,
-                seconds: Some(track.duration),
-            });
-        }
-    }
-    if let Ok(Some(track)) = crate::deezer::search_track(http, artist, &song.title).await {
-        let alike = similarity(&core_title(&song.title), &core_title(&track.title));
-        let apart = song.seconds.map(|s| (s - track.duration).abs());
-        if alike >= 0.85 && apart.is_none_or(|a| a <= SURE_APART) {
-            return Some(Found {
-                id: format!("https://www.deezer.com/track/{}", track.id),
-                title: track.title,
-                artist: track.artist,
-                seconds: Some(track.duration),
-            });
-        }
-    }
-    None
-}
-
 /// The downloads of the songs `picks` chose of `listing` (each its place in the list and the
 /// song found for it), into the music library as its own songs are, each placed as the list says
 /// (an album's artist, year and numbers; its cover); a playlist also writes its `.m3u8` in

@@ -234,10 +234,23 @@ pub fn normalize_audio(path: &Path, ffmpeg: &Path) -> Result<(), String> {
     let temp_name = format!("{}.norm.tmp.{}", path.file_stem().and_then(|s| s.to_str()).unwrap_or("track"), ext);
     let temp_path = path.with_file_name(temp_name);
 
+    let ogg = matches!(ext.to_ascii_lowercase().as_str(), "opus" | "ogg");
+    // ffmpeg writes no cover into an Ogg file: one that has a cover is left as it is.
+    if ogg && has_cover(path, ffmpeg) {
+        return Err("an Opus or Ogg file's cover cannot be kept: the file is left as it is".into());
+    }
+
     let mut cmd = std::process::Command::new(ffmpeg);
+    // shortcut: always 48 kHz out (loudnorm works at 192 kHz and would leave that rate, a FLAC
+    // many times its size); read the source's rate to keep it once hi-res sources matter.
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(path)
-        .args(["-af", "loudnorm=I=-14:LRA=11:TP=-1.0", "-map_metadata", "0"]);
+        .args(["-map", "0:a", "-af", "loudnorm=I=-14:LRA=11:TP=-1.0", "-ar", "48000", "-map_metadata", "0"]);
+    // The cover goes along as it is: left to itself ffmpeg encodes it again, as a video in an
+    // M4A, which that refuses.
+    if !ogg {
+        cmd.args(["-map", "0:v?", "-c:v", "copy"]);
+    }
 
     match ext.to_ascii_lowercase().as_str() {
         "flac" => { cmd.args(["-c:a", "flac"]); }
@@ -269,7 +282,41 @@ pub fn normalize_audio(path: &Path, ffmpeg: &Path) -> Result<(), String> {
     Err("normalized audio output was empty".into())
 }
 
-/// Tags audio file with metadata (title, artist, album) derived from filename or parameters.
+/// Whether `ffmpeg` finds a picture in `path` (a song's cover).
+fn has_cover(path: &Path, ffmpeg: &Path) -> bool {
+    let copied = std::process::Command::new(ffmpeg).args(["-hide_banner", "-loglevel", "quiet", "-i"]).arg(path).args(["-map", "0:v", "-c", "copy", "-f", "null", "-"]).output();
+    copied.is_ok_and(|output| output.status.success())
+}
+
+/// The names (lowercase) of the tags `ffmpeg` reads in `path`: the file's own and its first
+/// audio stream's, where Ogg keeps them.
+fn tags_in(path: &Path, ffmpeg: &Path) -> Result<Vec<String>, String> {
+    let output = std::process::Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-map_chapters", "-1", "-f", "ffmetadata", "pipe:1"])
+        .args(["-map_metadata", "0:s:a:0", "-map_chapters", "-1", "-f", "ffmetadata", "pipe:1"])
+        .output()
+        .map_err(|e| format!("failed to invoke ffmpeg: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg could not read the tags: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(tag_names(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The names (lowercase) of the tags that have a value in ffmpeg's `ffmetadata` text.
+fn tag_names(ffmetadata: &str) -> Vec<String> {
+    ffmetadata
+        .lines()
+        .filter(|line| !line.starts_with([';', '#', '[']))
+        .filter_map(|line| line.split_once('='))
+        .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(name, _)| name.trim().to_ascii_lowercase())
+        .collect()
+}
+
+/// Names an audio file's title, artist and album where it has none: from the parameters, else
+/// from a file name of the form `Artist - Title`. A tag the file has already is kept.
 pub fn tag_audio(path: &Path, ffmpeg: &Path, title: Option<&str>, artist: Option<&str>, album: Option<&str>) -> Result<(), String> {
     if !path.is_file() {
         return Err("file does not exist".into());
@@ -288,25 +335,24 @@ pub fn tag_audio(path: &Path, ffmpeg: &Path, title: Option<&str>, artist: Option
         (None, None)
     };
 
-    let title_val = title.or(parsed_title).unwrap_or(stem);
-    let artist_val = artist.or(parsed_artist);
+    // A tag the file has is kept: the download's own title is better than its file name.
+    let has = tags_in(path, ffmpeg)?;
+    let missing = |name: &str| !has.iter().any(|tag| tag == name);
+    let title_val = Some(title.or(parsed_title).unwrap_or(stem)).filter(|t| !t.is_empty() && missing("title"));
+    let artist_val = artist.or(parsed_artist).filter(|a| !a.is_empty() && missing("artist"));
+    let album_val = album.filter(|a| !a.is_empty() && missing("album"));
+    if title_val.is_none() && artist_val.is_none() && album_val.is_none() {
+        return Ok(());
+    }
 
     let mut cmd = std::process::Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(path)
         .args(["-c", "copy"]);
 
-    if !title_val.is_empty() {
-        cmd.args(["-metadata", &format!("title={title_val}")]);
-    }
-    if let Some(art) = artist_val {
-        if !art.is_empty() {
-            cmd.args(["-metadata", &format!("artist={art}")]);
-        }
-    }
-    if let Some(alb) = album {
-        if !alb.is_empty() {
-            cmd.args(["-metadata", &format!("album={alb}")]);
+    for (name, value) in [("title", title_val), ("artist", artist_val), ("album", album_val)] {
+        if let Some(value) = value {
+            cmd.args(["-metadata", &format!("{name}={value}")]);
         }
     }
     cmd.arg(&temp_path);
@@ -1133,5 +1179,14 @@ mod tests {
         };
         assert!(custom_post.audio_normalize);
         assert!(custom_post.audio_tag);
+    }
+
+    /// The tags a file has are the ones with a value, of both of ffmpeg's listings (the file's
+    /// own, then its audio stream's), whatever their case; comment and section lines are none.
+    #[test]
+    fn test_the_tags_a_file_has_are_read_from_ffmpegs_listing() {
+        let listing = ";FFMETADATA1\nTITLE=Real Title\nartist=\nencoder=Lavf62\n;FFMETADATA1\nArtist=Some = One\n[CHAPTER]\n# note\n";
+        assert_eq!(tag_names(listing), ["title", "encoder", "artist"]);
+        assert!(tag_names(";FFMETADATA1\nencoder=Lavf62\n").iter().all(|tag| tag != "title"));
     }
 }

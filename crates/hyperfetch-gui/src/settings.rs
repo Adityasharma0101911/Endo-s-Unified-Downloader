@@ -18,7 +18,7 @@ pub const MEDIA_PRESETS: [&str; 6] = [
     "720p HD (Merged MP4)",
     "Audio Only (MP3)",
     "Audio Only (M4A)",
-    "Audio Only (FLAC Lossless)",
+    "Audio Only (FLAC)",
 ];
 
 /// What `Settings::sponsorblock` does with a YouTube video's SponsorBlock segments.
