@@ -3,7 +3,7 @@
 //! lists every kind with an example to try and what it needs (your account, a helper tool). A new
 //! source is a new row of [`KINDS`], not a new screen.
 
-use hyperfetch_core::{archives, cloud, debrid, feeds, folders, gallery, iasearch, itch, kaggle, mega, mods, oci, osm, packages, repos, shares, torrent, wayback};
+use hyperfetch_core::{archives, cloud, debrid, feeds, folders, gallery, iasearch, itch, kaggle, mega, mods, oci, osm, packages, repos, resolver, shares, torrent, wayback};
 use url::Url;
 
 use super::*;
@@ -283,6 +283,19 @@ pub const KINDS: &[Kind] = &[
         },
     },
     Kind {
+        name: "A book or document",
+        group: "Science, archives & maps",
+        glyph: icon::BOOKS,
+        about: "Books, papers and articles from Anna's Archive, Library Genesis and digital repositories, resolved to fast unthrottled mirrors.",
+        example: "https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543",
+        needs: Needs::Nothing,
+        choice: Choice::None,
+        matches: |_, url| web(url).is_some_and(|url| {
+            resolver::AnnaArchiveResolver::can_handle(url)
+                || resolver::LibGenResolver::can_handle(url)
+        }),
+    },
+    Kind {
         name: "A map extract",
         group: "Science, archives & maps",
         glyph: icon::MAP_TRIFOLD,
@@ -412,10 +425,11 @@ pub const KINDS: &[Kind] = &[
         example: "https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz",
         needs: Needs::Nothing,
         choice: Choice::None,
-        // A name with an extension, but not a page's (.html is a web page).
+        // A name with an extension, but not a page's (.html is a web page), or a host SmartResolver handles.
         matches: |text, url| {
+            let handled = web(url).is_some_and(|url| resolver::SmartResolver::handles(url));
             let named = web(url).is_some_and(|url| url.path_segments().and_then(|mut s| s.next_back()).is_some_and(|last| last.contains('.')));
-            named && !ends_with(text, url, PAGES)
+            handled || (named && !ends_with(text, url, PAGES))
         },
     },
     Kind {
@@ -519,6 +533,9 @@ mod tests {
         assert_eq!(name("https://cdn.example/v/master.m3u8").unwrap().0, "A stream");
         assert_eq!(name("https://arxiv.org/abs/1706.03762").unwrap().0, "A paper");
         assert_eq!(name("10.1038/nature12373").unwrap().0, "A paper");
+        assert_eq!(name("https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543").unwrap().0, "A book or document");
+        assert_eq!(name("https://annas-archive.org/md5/8f07ef504d743288f62539da685d2543").unwrap().0, "A book or document");
+        assert_eq!(name("https://library.lol/main/8f07ef504d743288f62539da685d2543").unwrap().0, "A book or document");
         assert_eq!(name("https://a.example/f.iso https://b.example/f.iso").map(|(_, source)| source).as_deref(), Some("a.example and 1 more servers"));
         assert_eq!(name("https://a.example/1.iso\nhttps://a.example/2.iso").unwrap().0, "Several links");
         assert_eq!(name("ftp://ftp.example/pub/a.iso").unwrap().0, "A file on a server");
@@ -545,7 +562,14 @@ mod tests {
     fn only_file_links_are_named_by_their_link() {
         let named: Vec<&str> = KINDS.iter().filter(|kind| named_by_link(kind)).map(|kind| kind.name).collect();
         assert_eq!(named.len(), 8, "{named:?}");
-        for text in ["https://www.youtube.com/watch?v=aqz-KE-bpKQ", "https://www.youtube.com/@BlenderOfficial/videos", "https://arxiv.org/abs/1706.03762", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8", "https://example.com/"] {
+        for text in [
+            "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+            "https://www.youtube.com/@BlenderOfficial/videos",
+            "https://arxiv.org/abs/1706.03762",
+            "https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543",
+            "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+            "https://example.com/",
+        ] {
             assert!(!named_by_link(recognise(text).unwrap().0), "{text}");
         }
         assert!(named_by_link(recognise("https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz").unwrap().0));

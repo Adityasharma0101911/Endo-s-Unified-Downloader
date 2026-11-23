@@ -1435,6 +1435,7 @@ mod tests {
         assert_eq!(named("https://www.youtube.com/watch?v=aqz-KE-bpKQ"), None);
         assert_eq!(named("https://www.youtube.com/@BlenderOfficial/videos"), None);
         assert_eq!(named("https://arxiv.org/abs/1706.03762"), None);
+        assert_eq!(named("https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543"), None);
         assert_eq!(named("https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz").as_deref(), Some("hello-2.12.1.tar.gz"));
         assert_eq!(named("magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny").as_deref(), Some("Big Buck Bunny"));
         let mut h = Harness::new();
@@ -1834,5 +1835,23 @@ mod tests {
         h.click("Got it");
         h.frames(5);
         assert!(h.app.settings.welcomed && h.find("Welcome").is_none());
+    }
+
+    /// An Anna's Archive book link is recognised as a book, shows its source, does not offer
+    /// saving as a webpage, and starts a document download into the queue.
+    #[test]
+    fn annas_archive_book_is_recognised_and_downloaded_as_document() {
+        let mut h = Harness::new();
+        h.app.url_input = "https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543".to_string();
+        h.frames(30);
+        assert!(h.find("A book or document").is_some(), "{:?}", h.texts());
+        assert!(h.find("from annas-archive.gl").is_some(), "{:?}", h.texts());
+        assert!(h.find("Save this page as one file").is_none(), "{:?}", h.texts());
+        assert!(h.find("Its name comes from the site once it starts").is_some(), "{:?}", h.texts());
+        start_from_form(&mut h.app);
+        assert_eq!(h.app.queue.items().len(), 1);
+        let item = &h.app.queue.items()[0];
+        assert_eq!(item.urls[0].as_str(), "https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543");
+        assert_eq!(item.options.media_preset, None);
     }
 }
